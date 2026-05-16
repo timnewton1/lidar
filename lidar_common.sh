@@ -246,16 +246,25 @@ process_tiles() {
       set +x
     fi
 
-    # 4e: Extract bbox and write GroundOverlay fragment
-    local GINFO
-    GINFO=$("${GDALINFO[@]}" "${WGS84_TIF}")
-    local UL LR WEST NORTH EAST SOUTH
-    UL=$(echo "${GINFO}" | grep "Upper Left"  | grep -oP '\(\s*[-0-9.]+,\s*[-0-9.]+\)' || true)
-    LR=$(echo "${GINFO}" | grep "Lower Right" | grep -oP '\(\s*[-0-9.]+,\s*[-0-9.]+\)' || true)
-    WEST=$(echo  "${UL}" | grep -oP '[-0-9.]+' | head -1 || true)
-    NORTH=$(echo "${UL}" | grep -oP '[-0-9.]+' | tail -1 || true)
-    EAST=$(echo  "${LR}" | grep -oP '[-0-9.]+' | head -1 || true)
-    SOUTH=$(echo "${LR}" | grep -oP '[-0-9.]+' | tail -1 || true)
+    # 4e: Extract bbox (cached in .bbox sidecar to avoid repeated flatpak calls)
+    local BBOX_FILE="${WGS84_DIR}/${BASENAME}.bbox"
+    local WEST NORTH EAST SOUTH
+    if [[ -f "${BBOX_FILE}" ]]; then
+      read -r NORTH SOUTH EAST WEST < "${BBOX_FILE}"
+    else
+      local GINFO
+      GINFO=$("${GDALINFO[@]}" "${WGS84_TIF}")
+      local UL LR
+      UL=$(echo "${GINFO}" | grep "Upper Left"  | grep -oP '\(\s*[-0-9.]+,\s*[-0-9.]+\)' || true)
+      LR=$(echo "${GINFO}" | grep "Lower Right" | grep -oP '\(\s*[-0-9.]+,\s*[-0-9.]+\)' || true)
+      WEST=$(echo  "${UL}" | grep -oP '[-0-9.]+' | head -1 || true)
+      NORTH=$(echo "${UL}" | grep -oP '[-0-9.]+' | tail -1 || true)
+      EAST=$(echo  "${LR}" | grep -oP '[-0-9.]+' | head -1 || true)
+      SOUTH=$(echo "${LR}" | grep -oP '[-0-9.]+' | tail -1 || true)
+      if [[ -n "${NORTH}" && -n "${SOUTH}" && -n "${EAST}" && -n "${WEST}" ]]; then
+        echo "${NORTH} ${SOUTH} ${EAST} ${WEST}" > "${BBOX_FILE}"
+      fi
+    fi
 
     if [[ -z "${WEST}" || -z "${NORTH}" || -z "${EAST}" || -z "${SOUTH}" ]]; then
       echo "  WARNING: Could not parse bbox — skipping KML entry"
