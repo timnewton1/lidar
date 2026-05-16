@@ -249,6 +249,7 @@ derive_shading() {
 reproject_to_wgs84() {
   local in="$1" out="$2"
   "${GDALWARP[@]}" -t_srs EPSG:4326 -r bilinear \
+    -multi -wo NUM_THREADS=ALL_CPUS \
     -co COMPRESS=DEFLATE -co TILED=YES \
     "${in}" "${out}"
 }
