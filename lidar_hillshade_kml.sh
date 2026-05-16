@@ -102,32 +102,42 @@ BYTES_TOTAL=0
 BYTES_DONE=0
 TILES_CACHED=0
 TILES_PENDING=0
-SCAN_N=0
 
+# Quick pass: stat cached tiles, collect pending URLs
+PENDING_URLS=()
 while IFS= read -r URL; do
   [[ -z "${URL}" ]] && continue
-  SCAN_N=$((SCAN_N + 1))
-  printf "\r  Scanning %d/%d..." "${SCAN_N}" "${TOTAL_TILES}"
-
   BASENAME=$(basename "${URL}" .tif)
   TILE_TIF="${DEM_DIR}/${BASENAME}.tif"
-
   if [[ -f "${TILE_TIF}" ]]; then
     SIZE=$(stat -c %s "${TILE_TIF}")
     BYTES_DONE=$((BYTES_DONE + SIZE))
-    BYTES_TOTAL=$((BYTES_TOTAL + SIZE))
     TILES_CACHED=$((TILES_CACHED + 1))
   else
+    PENDING_URLS+=("${URL}")
+    TILES_PENDING=$((TILES_PENDING + 1))
+  fi
+done < "${FILTERED_LIST}"
+
+if [[ ${TILES_PENDING} -eq 0 ]]; then
+  echo "  All ${TILES_CACHED} tiles cached — skipping HEAD scan"
+  BYTES_TOTAL="${BYTES_DONE}"
+else
+  echo "  Cached: ${TILES_CACHED}  Pending: ${TILES_PENDING} — fetching sizes..."
+  BYTES_TOTAL="${BYTES_DONE}"
+  SCAN_N=0
+  for URL in "${PENDING_URLS[@]}"; do
+    SCAN_N=$((SCAN_N + 1))
+    printf "\r  HEAD %d/%d..." "${SCAN_N}" "${TILES_PENDING}"
     SIZE=$(curl -sI "${URL}" \
            | grep -i '^content-length:' \
            | awk '{print $2}' | tr -d '\r' || echo 0)
     SIZE=${SIZE:-0}
     BYTES_TOTAL=$((BYTES_TOTAL + SIZE))
-    TILES_PENDING=$((TILES_PENDING + 1))
-  fi
-done < "${FILTERED_LIST}"
+  done
+  echo ""
+fi
 
-echo ""
 echo "  Already cached : ${TILES_CACHED} tiles  ($(human_bytes "${BYTES_DONE}"))"
 echo "  To download    : ${TILES_PENDING} tiles"
 echo "  Total size     : $(human_bytes "${BYTES_TOTAL}")"
