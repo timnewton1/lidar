@@ -190,7 +190,7 @@ download_tiles() {
     printf "  [%d/%d] %s — downloading [%s / %s]\n" \
       "${PROCESSED}" "${TOTAL_TILES}" "${BASENAME}" \
       "$(human_bytes "${BYTES_DOWNLOADED}")" "$(human_bytes "${BYTES_TOTAL}")"
-    if ! curl -f -L --retry 3 --retry-delay 5 -# -o "${TILE_TIF}" "${URL}"; then
+    if ! curl -f -L --retry 3 --retry-delay 5 -o "${TILE_TIF}" "${URL}"; then
       echo "  ERROR: download failed for ${URL}" >&2
       ERRORS=$((ERRORS + 1))
       continue
