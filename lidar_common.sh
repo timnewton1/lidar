@@ -243,22 +243,3 @@ process_tiles() {
   echo "=========================================="
 }
 
-# ─── build_wgs84_list <output_file> ──────────────────────────────────────────
-# Writes one absolute path per line for each cached WGS84 GeoTIFF in FILTERED_LIST.
-# Returns the number of tiles in the list via stdout.
-build_wgs84_list() {
-  local out="$1"
-  : > "${out}"
-  local n=0
-  while IFS= read -r URL; do
-    [[ -z "${URL}" ]] && continue
-    local BASENAME
-    BASENAME=$(basename "${URL}" .tif)
-    local WGS84_TIF="${WGS84_DIR}/${BASENAME}_wgs84.tif"
-    if [[ -f "${WGS84_TIF}" ]]; then
-      echo "${WGS84_TIF}" >> "${out}"
-      n=$((n + 1))
-    fi
-  done < "${FILTERED_LIST}"
-  echo "${n}"
-}
