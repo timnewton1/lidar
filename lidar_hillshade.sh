@@ -1,51 +1,75 @@
 #!/usr/bin/env bash
-# Usage: lidar_hillshade.sh [--kmz] <downloadlist.txt>
+# Usage: lidar_hillshade.sh [options] <downloadlist.txt>
 #
-# Builds a KML super-overlay (tile pyramid) from a list of USGS 3DEP LiDAR
-# DEM URLs. Pyramidal LoD with quadtree NetworkLinks — Google Earth's
-# intended pattern for large datasets. No lag, no blank zoom-out, constant
-# memory regardless of tile count.
+# Options:
+#   --shading LIST   comma-separated shadings to render. Default: hillshade
+#                    Known: hillshade, slopeshade
+#   --name NAME      output directory + root KML <name>. Default: superoverlay_TIMESTAMP
+#   --gis-dir PATH   override GIS_DIR for this run
+#   --kmz            also package the pyramid into a portable .kmz file
+#   -h, --help       show this help
 #
-# Default output: $GIS_DIR/lidar/kml/superoverlay_TIMESTAMP/  (open doc.kml)
-# With --kmz:    also produces $GIS_DIR/lidar/kmz/lidar_hillshade_TIMESTAMP.kmz
-#                — a portable single-file copy of the pyramid for sharing.
-#
-# Requires:
-#   export GIS_DIR=/mnt/data/gis
-#   flatpak app org.qgis.qgis
-#   (zip, only if --kmz)
+# Output: $GIS_DIR/lidar/kml/<name>/doc.kml
+#   Layout: kml/<name>/<shading>/<project>/doc.kml
+#   Root KML NetworkLinks one entry per shading; each shading's intermediate
+#   KML NetworkLinks one entry per project.
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)
-# shellcheck source=lidar_common.sh
-source "${SCRIPT_DIR}/lidar_common.sh"
-
 usage() {
-  echo "Usage: $0 [--kmz] <downloadlist.txt>"
-  echo "  --kmz   also package the pyramid into a portable .kmz file"
-  exit 1
+  sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  exit "${1:-1}"
 }
 
+SHADINGS_CSV="hillshade"
+NAME=""
 PACKAGE_KMZ=0
+GIS_DIR_OVERRIDE=""
 DOWNLOAD_LIST=""
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --kmz)   PACKAGE_KMZ=1; shift ;;
-    -h|--help) usage ;;
-    -*)      echo "Unknown flag: $1"; usage ;;
+    --shading)  SHADINGS_CSV="$2"; shift 2 ;;
+    --name)     NAME="$2"; shift 2 ;;
+    --gis-dir)  GIS_DIR_OVERRIDE="$2"; shift 2 ;;
+    --kmz)      PACKAGE_KMZ=1; shift ;;
+    -h|--help)  usage 0 ;;
+    -*)         echo "Unknown flag: $1" >&2; usage ;;
     *)
-      [[ -n "${DOWNLOAD_LIST}" ]] && { echo "Too many arguments"; usage; }
+      [[ -n "${DOWNLOAD_LIST}" ]] && { echo "Too many arguments" >&2; usage; }
       DOWNLOAD_LIST="$1"; shift ;;
   esac
 done
 [[ -z "${DOWNLOAD_LIST}" ]] && usage
 
-KML_DIR="${LIDAR_DIR}/kml"
-OUT_DIR="${KML_DIR}/superoverlay_${TIMESTAMP}"
+[[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
 
-# Work dir lives under $GIS_DIR so the GDAL flatpak sandbox can read it.
-# /tmp is not exposed to flatpak by default.
+SCRIPT_DIR=$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=lidar_common.sh
+source "${SCRIPT_DIR}/lidar_common.sh"
+
+# ─── Parse + validate shadings ───────────────────────────────────────────────
+IFS=',' read -r -a SHADINGS <<< "${SHADINGS_CSV}"
+for s in "${SHADINGS[@]}"; do
+  is_known_shading "${s}" || {
+    echo "ERROR: unknown shading: ${s}" >&2
+    echo "  Known: ${KNOWN_SHADINGS[*]}" >&2
+    exit 1
+  }
+done
+
+[[ -z "${NAME}" ]] && NAME="superoverlay_${TIMESTAMP}"
+
+KML_DIR="${LIDAR_DIR}/kml"
+OUT_DIR="${KML_DIR}/${NAME}"
+
+if [[ -e "${OUT_DIR}" ]]; then
+  echo "ERROR: output directory already exists: ${OUT_DIR}" >&2
+  echo "  Choose a different --name or remove the existing directory." >&2
+  exit 1
+fi
+
+# Flatpak sandbox cannot read /tmp — work dir must live under LIDAR_DIR.
 WORK_DIR=$(mktemp -d "${LIDAR_DIR}/.work_XXXXXX")
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
@@ -55,9 +79,9 @@ extra_deps=()
 check_deps_and_input "${DOWNLOAD_LIST}" "${extra_deps[@]+"${extra_deps[@]}"}"
 prescan
 make_dirs "${KML_DIR}"
-process_tiles
+download_tiles
 
-# ─── Step 5: Group WGS84 tiles by USGS project ───────────────────────────────
+# ─── Step 5: Group downloaded DEM tiles by USGS project ──────────────────────
 echo "=========================================="
 echo "STEP 5: Grouping tiles by project"
 echo "=========================================="
@@ -71,8 +95,8 @@ SKIPPED_NO_PROJECT=0
 while IFS= read -r URL; do
   [[ -z "${URL}" ]] && continue
   BASENAME="${URL##*/}"; BASENAME="${BASENAME%.tif}"
-  WGS84_TIF="${WGS84_DIR}/${BASENAME}_wgs84.tif"
-  if [[ ! -f "${WGS84_TIF}" ]]; then
+  TILE_TIF="${DEM_DIR}/${BASENAME}.tif"
+  if [[ ! -f "${TILE_TIF}" ]]; then
     MISSING=$((MISSING + 1))
     continue
   fi
@@ -82,14 +106,14 @@ while IFS= read -r URL; do
     echo "  WARNING: no Projects/<name>/ segment in URL — skipping: ${URL}"
     continue
   fi
-  echo "${WGS84_TIF}" >> "${LISTS_DIR}/${PROJECT}.list"
+  echo "${TILE_TIF}" >> "${LISTS_DIR}/${PROJECT}.list"
   PROJECT_COUNT["${PROJECT}"]=$((${PROJECT_COUNT["${PROJECT}"]:-0} + 1))
 done < "${FILTERED_LIST}"
 
 mapfile -t PROJECT_NAMES < <(printf '%s\n' "${!PROJECT_COUNT[@]}" | sort)
 
 if [[ ${#PROJECT_NAMES[@]} -eq 0 ]]; then
-  echo "ERROR: no WGS84 tiles available to mosaic (${MISSING} missing, ${SKIPPED_NO_PROJECT} skipped)"
+  echo "ERROR: no DEM tiles available to mosaic (${MISSING} missing, ${SKIPPED_NO_PROJECT} skipped)"
   exit 1
 fi
 
@@ -98,59 +122,103 @@ for PROJECT in "${PROJECT_NAMES[@]}"; do
   printf "    %-60s %5d tiles\n" "${PROJECT}" "${PROJECT_COUNT[${PROJECT}]}"
 done
 
-# ─── Step 6: Per-project VRT + gdal2tiles super-overlay ──────────────────────
+# ─── Step 6: Per-shading × per-project pyramids ──────────────────────────────
 echo "=========================================="
-echo "STEP 6: Generating per-project tile pyramids"
+echo "STEP 6: Generating tile pyramids (${#SHADINGS[@]} shading(s) × ${#PROJECT_NAMES[@]} project(s))"
 echo "=========================================="
 
 mkdir -p "${OUT_DIR}"
 PROCESSES=$(nproc 2>/dev/null || echo 4)
 
+# Per-project DEM VRT is built once and reused across shadings.
+declare -A DEM_VRT=()
 for PROJECT in "${PROJECT_NAMES[@]}"; do
-  LIST="${LISTS_DIR}/${PROJECT}.list"
-  VRT="${WORK_DIR}/${PROJECT}.vrt"
-  PROJ_OUT="${OUT_DIR}/${PROJECT}"
-  mkdir -p "${PROJ_OUT}"
-
-  echo "------------------------------------------"
-  echo "Project: ${PROJECT}  (${PROJECT_COUNT[${PROJECT}]} tiles)"
-  echo "------------------------------------------"
-
-  "${GDALBUILDVRT[@]}" -input_file_list "${LIST}" "${VRT}"
-  # -t sets the sub-doc.kml <name> so GE's sidebar shows the project name
-  "${GDAL2TILES[@]}" \
-    -p geodetic -k -r average \
-    -t "${PROJECT}" \
-    --processes="${PROCESSES}" \
-    "${VRT}" "${PROJ_OUT}"
+  VRT="${WORK_DIR}/${PROJECT}_dem.vrt"
+  "${GDALBUILDVRT[@]}" -input_file_list "${LISTS_DIR}/${PROJECT}.list" "${VRT}"
+  DEM_VRT["${PROJECT}"]="${VRT}"
 done
 
-# ─── Step 7: Write root doc.kml with NetworkLinks to each project ────────────
+for SHADING in "${SHADINGS[@]}"; do
+  SHADING_DIR="${OUT_DIR}/${SHADING}"
+  mkdir -p "${SHADING_DIR}"
+
+  for PROJECT in "${PROJECT_NAMES[@]}"; do
+    PROJ_OUT="${SHADING_DIR}/${PROJECT}"
+    mkdir -p "${PROJ_OUT}"
+    SHADE_TIF="${WORK_DIR}/${SHADING}_${PROJECT}.tif"
+    WGS84_TIF="${WORK_DIR}/${SHADING}_${PROJECT}_wgs84.tif"
+
+    echo "------------------------------------------"
+    echo "${SHADING} / ${PROJECT}  (${PROJECT_COUNT[${PROJECT}]} tiles)"
+    echo "------------------------------------------"
+
+    echo "  Deriving ${SHADING}..."
+    derive_shading "${SHADING}" "${DEM_VRT[${PROJECT}]}" "${SHADE_TIF}"
+
+    echo "  Reprojecting to WGS84..."
+    reproject_to_wgs84 "${SHADE_TIF}" "${WGS84_TIF}"
+
+    echo "  Building tile pyramid..."
+    # -t sets the project sub-doc.kml <name> for GE sidebar
+    "${GDAL2TILES[@]}" \
+      -p geodetic -k -r average \
+      --tiledriver=JPEG --jpeg-quality=88 \
+      -t "${PROJECT}" \
+      --processes="${PROCESSES}" \
+      "${WGS84_TIF}" "${PROJ_OUT}"
+
+    rm -f "${SHADE_TIF}" "${WGS84_TIF}"
+  done
+done
+
+# ─── Step 7: Write intermediate per-shading KMLs and root KML ────────────────
 echo "=========================================="
-echo "STEP 7: Writing root KML"
+echo "STEP 7: Writing KML index"
 echo "=========================================="
 
+# Per-shading intermediate doc.kml: NetworkLinks one entry per project
+for SHADING in "${SHADINGS[@]}"; do
+  SHADING_KML="${OUT_DIR}/${SHADING}/doc.kml"
+  {
+    cat <<HEAD
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+  <name>${SHADING}</name>
+  <open>1</open>
+HEAD
+    for PROJECT in "${PROJECT_NAMES[@]}"; do
+      cat <<NL
+  <NetworkLink>
+    <name>${PROJECT}</name>
+    <visibility>1</visibility>
+    <Link><href>${PROJECT}/doc.kml</href></Link>
+  </NetworkLink>
+NL
+    done
+    cat <<'TAIL'
+</Document>
+</kml>
+TAIL
+  } > "${SHADING_KML}"
+done
+
+# Root doc.kml: NetworkLinks one entry per shading
 ROOT_KML="${OUT_DIR}/doc.kml"
-if [[ ${#PROJECT_NAMES[@]} -eq 1 ]]; then
-  DOC_NAME="${PROJECT_NAMES[0]}"
-else
-  DOC_NAME="LiDAR Hillshade — ${#PROJECT_NAMES[@]} projects"
-fi
-
 {
   cat <<HEAD
 <?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
 <Document>
-  <name>${DOC_NAME}</name>
+  <name>${NAME}</name>
   <open>1</open>
 HEAD
-  for PROJECT in "${PROJECT_NAMES[@]}"; do
+  for SHADING in "${SHADINGS[@]}"; do
     cat <<NL
   <NetworkLink>
-    <name>${PROJECT}</name>
+    <name>${SHADING}</name>
     <visibility>1</visibility>
-    <Link><href>${PROJECT}/doc.kml</href></Link>
+    <Link><href>${SHADING}/doc.kml</href></Link>
   </NetworkLink>
 NL
   done
@@ -168,8 +236,7 @@ if [[ ${PACKAGE_KMZ} -eq 1 ]]; then
   echo "=========================================="
   KMZ_DIR="${LIDAR_DIR}/kmz"
   mkdir -p "${KMZ_DIR}"
-  KMZ_OUT="${KMZ_DIR}/lidar_hillshade_${TIMESTAMP}.kmz"
-  # KMZ = zip with doc.kml at root. Exclude GDAL aux sidecars.
+  KMZ_OUT="${KMZ_DIR}/${NAME}.kmz"
   ( cd "${OUT_DIR}" && zip -rq "${KMZ_OUT}" . -x '*.aux.xml' )
   echo "  KMZ: ${KMZ_OUT} ($(human_bytes "$(stat -c %s "${KMZ_OUT}")"))"
 fi
@@ -182,5 +249,4 @@ echo "Pyramid  : ${OUT_DIR}/  ($(du -sh "${OUT_DIR}" | cut -f1))"
 [[ -n "${KMZ_OUT}" ]] && echo "Portable : ${KMZ_OUT}"
 echo ""
 echo "Open in Google Earth Pro via File → Open"
-echo "  Pyramidal LoD — smooth zoom from extent to native resolution"
 echo "=========================================="

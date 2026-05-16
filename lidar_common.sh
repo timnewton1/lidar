@@ -1,25 +1,32 @@
 #!/usr/bin/env bash
-# Shared library for the lidar hillshade pipeline.
+# Shared library for the lidar shading pipeline.
 # Source this file; do not execute it directly.
 #
-# Pipeline produces WGS84 hillshade GeoTIFFs ready to be fed into a
-# super-overlay generator (gdal2tiles / gdal_translate KMLSUPEROVERLAY).
-# All KML/KMZ packaging is the caller's responsibility.
+# Pipeline: download DEMs → per-project VRT of native DEMs → derive shading
+# (hillshade/slopeshade) on the mosaic → reproject to WGS84 → gdal2tiles
+# super-overlay. Per-project mosaics eliminate seam artifacts that arise from
+# per-tile sun-angle calculations.
 #
-# Required (must be set in environment before sourcing):
+# Required (must be set before sourcing OR via --gis-dir in the caller):
 #   GIS_DIR  — root GIS data directory (e.g. /mnt/data/gis)
 
 [[ -n "${_LIDAR_COMMON_LOADED:-}" ]] && return 0
 _LIDAR_COMMON_LOADED=1
 
-: "${GIS_DIR:?GIS_DIR is not set — add 'export GIS_DIR=/mnt/data/gis' to ~/.bashrc}"
+if [[ -z "${GIS_DIR:-}" ]]; then
+  echo "ERROR: GIS_DIR is not set." >&2
+  echo "  Either: export GIS_DIR=/path/to/gis" >&2
+  echo "  Or pass: --gis-dir /path/to/gis" >&2
+  exit 1
+fi
 
 # ─── Directory layout ────────────────────────────────────────────────────────
+# Only DEM_DIR is persistent — the download cache. All derived rasters
+# (hillshade, slopeshade, reprojected) are per-run scratch under WORK_DIR
+# (created by the caller, cleaned via trap). Flatpak GDAL sandbox cannot
+# read /tmp, so WORK_DIR must live under LIDAR_DIR.
 LIDAR_DIR="${GIS_DIR}/lidar"
-TILES_BASE="${LIDAR_DIR}/tiles"
-DEM_DIR="${TILES_BASE}/dem"
-HILLSHADE_DIR="${TILES_BASE}/hillshade"
-WGS84_DIR="${TILES_BASE}/wgs84"
+DEM_DIR="${LIDAR_DIR}/tiles/dem"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
@@ -31,15 +38,23 @@ GDALBUILDVRT=(flatpak  run --command=gdalbuildvrt   "${GDAL_FLATPAK_APP}")
 GDAL2TILES=(flatpak    run --command=gdal2tiles.py  "${GDAL_FLATPAK_APP}")
 
 # ─── Hillshade parameters ────────────────────────────────────────────────────
-AZIMUTH=315
-ALTITUDE=45
-Z_FACTOR=1.5
+HS_AZIMUTH=315
+HS_ALTITUDE=45
+HS_Z_FACTOR=1.5
+
+# ─── Known shadings ──────────────────────────────────────────────────────────
+KNOWN_SHADINGS=(hillshade slopeshade)
+
+is_known_shading() {
+  local s="$1" k
+  for k in "${KNOWN_SHADINGS[@]}"; do [[ "${k}" == "${s}" ]] && return 0; done
+  return 1
+}
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 human_bytes() { numfmt --to=iec --suffix=B --format='%.1f' "$1"; }
 
 # Extract USGS project name from URL: ".../Projects/<NAME>/..." → "<NAME>"
-# Echoes empty string if URL doesn't match.
 project_from_url() {
   local rest="${1#*/Projects/}"
   [[ "${rest}" == "$1" ]] && { echo ""; return; }
@@ -145,96 +160,95 @@ make_dirs() {
   echo "=========================================="
   echo "STEP 3: Creating output directories"
   echo "=========================================="
-  mkdir -p "${DEM_DIR}" "${HILLSHADE_DIR}" "${WGS84_DIR}" "$@"
+  mkdir -p "${DEM_DIR}" "$@"
 }
 
-# ─── Step 4: process_tiles ───────────────────────────────────────────────────
-# For each URL in FILTERED_LIST: download DEM → generate hillshade → reproject
-# to WGS84. Each step is cached on disk and skipped if already done.
-process_tiles() {
+# ─── Step 4: download_tiles ──────────────────────────────────────────────────
+# Download every URL in FILTERED_LIST into DEM_DIR. Skips already-cached files.
+# Each tile's progress bar gets its own line with a percentage.
+download_tiles() {
   echo "=========================================="
-  echo "STEP 4: Processing ${TOTAL_TILES} tiles"
+  echo "STEP 4: Downloading ${TOTAL_TILES} tiles"
   echo "=========================================="
 
   local PROCESSED=0
   local ERRORS=0
   local BYTES_DOWNLOADED="${BYTES_DONE}"
 
-  local fetch_dem hillshade_dem
-  fetch_dem() {
-    curl -f -L --retry 3 --retry-delay 5 -# -o "$1" "$2"
-  }
-  hillshade_dem() {
-    "${GDALDEM[@]}" hillshade "$1" "$2" \
-      -az "${AZIMUTH}" -alt "${ALTITUDE}" -z "${Z_FACTOR}" \
-      -alg ZevenbergenThorne -combined \
-      -co COMPRESS=DEFLATE -co TILED=YES
-  }
-
   while IFS= read -r URL; do
     [[ -z "${URL}" ]] && continue
 
     local BASENAME="${URL##*/}"; BASENAME="${BASENAME%.tif}"
     local TILE_TIF="${DEM_DIR}/${BASENAME}.tif"
-    local HILL_TIF="${HILLSHADE_DIR}/${BASENAME}_hillshade.tif"
-    local WGS84_TIF="${WGS84_DIR}/${BASENAME}_wgs84.tif"
-
-    echo "------------------------------------------"
-    echo "Tile $((PROCESSED + 1))/${TOTAL_TILES}: ${BASENAME}"
-    echo "------------------------------------------"
-
-    # 4a: Download
-    if [[ -f "${TILE_TIF}" ]]; then
-      echo "  [SKIP] Already downloaded"
-    else
-      echo "  Downloading... [$(human_bytes "${BYTES_DOWNLOADED}") / $(human_bytes "${BYTES_TOTAL}") total]"
-      fetch_dem "${TILE_TIF}" "${URL}"
-      local TILE_SIZE
-      TILE_SIZE=$(stat -c %s "${TILE_TIF}")
-      BYTES_DOWNLOADED=$((BYTES_DOWNLOADED + TILE_SIZE))
-      echo "  Downloaded $(human_bytes "${TILE_SIZE}") — total so far: $(human_bytes "${BYTES_DOWNLOADED}") / $(human_bytes "${BYTES_TOTAL}")"
-    fi
-
-    # 4b: Hillshade — retry once on corrupt tile by re-downloading
-    if [[ ! -f "${HILL_TIF}" ]]; then
-      local attempt success=0
-      for attempt in 1 2; do
-        echo "  Generating hillshade (attempt ${attempt}/2)..."
-        if hillshade_dem "${TILE_TIF}" "${HILL_TIF}"; then
-          success=1
-          break
-        fi
-        echo "  WARNING: hillshade failed — re-downloading tile and retrying..."
-        rm -f "${TILE_TIF}" "${HILL_TIF}"
-        fetch_dem "${TILE_TIF}" "${URL}"
-      done
-      if [[ ${success} -eq 0 ]]; then
-        echo "  ERROR: hillshade failed twice — skipping ${BASENAME}"
-        rm -f "${HILL_TIF}"
-        ERRORS=$((ERRORS + 1))
-        PROCESSED=$((PROCESSED + 1))
-        continue
-      fi
-    else
-      echo "  [SKIP] Hillshade exists"
-    fi
-
-    # 4c: Reproject to WGS84
-    if [[ -f "${WGS84_TIF}" ]]; then
-      echo "  [SKIP] WGS84 exists"
-    else
-      echo "  Reprojecting to WGS84..."
-      "${GDALWARP[@]}" -t_srs EPSG:4326 -r bilinear -co COMPRESS=DEFLATE \
-        "${HILL_TIF}" "${WGS84_TIF}"
-    fi
-
     PROCESSED=$((PROCESSED + 1))
-    echo "  Done"
 
+    if [[ -f "${TILE_TIF}" ]]; then
+      printf "  [%d/%d] %s — cached\n" "${PROCESSED}" "${TOTAL_TILES}" "${BASENAME}"
+      continue
+    fi
+
+    printf "  [%d/%d] %s — downloading [%s / %s]\n" \
+      "${PROCESSED}" "${TOTAL_TILES}" "${BASENAME}" \
+      "$(human_bytes "${BYTES_DOWNLOADED}")" "$(human_bytes "${BYTES_TOTAL}")"
+    if ! curl -f -L --retry 3 --retry-delay 5 -# -o "${TILE_TIF}" "${URL}"; then
+      echo "  ERROR: download failed for ${URL}" >&2
+      ERRORS=$((ERRORS + 1))
+      continue
+    fi
+    local TILE_SIZE
+    TILE_SIZE=$(stat -c %s "${TILE_TIF}")
+    BYTES_DOWNLOADED=$((BYTES_DOWNLOADED + TILE_SIZE))
   done < "${FILTERED_LIST}"
 
   echo "=========================================="
-  echo "STEP 4 complete — ${PROCESSED} tiles processed, ${ERRORS} errors"
+  echo "STEP 4 complete — ${PROCESSED} tiles, ${ERRORS} errors"
   echo "=========================================="
 }
 
+# ─── Derivation: shading algorithms ──────────────────────────────────────────
+# Each takes a DEM raster (native or WGS84) and writes a single-band byte
+# GeoTIFF ready to tile. Compute in the source projection — gdaldem handles
+# units when given a degree-spaced grid via -s; for projected (meter) grids
+# the default scale works.
+
+derive_hillshade() {
+  local in="$1" out="$2"
+  "${GDALDEM[@]}" hillshade "${in}" "${out}" \
+    -az "${HS_AZIMUTH}" -alt "${HS_ALTITUDE}" -z "${HS_Z_FACTOR}" \
+    -alg ZevenbergenThorne -combined -compute_edges \
+    -co COMPRESS=DEFLATE -co TILED=YES
+}
+
+# Slopeshade: slope in degrees → grayscale via color-relief
+# (steep = dark, flat = white). Two-step; uses a tmp slope raster.
+derive_slopeshade() {
+  local in="$1" out="$2"
+  local slope_tif="${out%.tif}_slope.tif"
+  local ramp="${out%.tif}_ramp.txt"
+  "${GDALDEM[@]}" slope "${in}" "${slope_tif}" \
+    -compute_edges -co COMPRESS=DEFLATE -co TILED=YES
+  cat > "${ramp}" <<'RAMP'
+0   255 255 255
+90    0   0   0
+RAMP
+  "${GDALDEM[@]}" color-relief "${slope_tif}" "${ramp}" "${out}" \
+    -co COMPRESS=DEFLATE -co TILED=YES
+  rm -f "${slope_tif}" "${ramp}"
+}
+
+derive_shading() {
+  local shading="$1" in="$2" out="$3"
+  case "${shading}" in
+    hillshade)  derive_hillshade  "${in}" "${out}" ;;
+    slopeshade) derive_slopeshade "${in}" "${out}" ;;
+    *) echo "ERROR: unknown shading: ${shading}" >&2; return 1 ;;
+  esac
+}
+
+# ─── Reproject helper ────────────────────────────────────────────────────────
+reproject_to_wgs84() {
+  local in="$1" out="$2"
+  "${GDALWARP[@]}" -t_srs EPSG:4326 -r bilinear \
+    -co COMPRESS=DEFLATE -co TILED=YES \
+    "${in}" "${out}"
+}
