@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
-# Shared library for lidar_hillshade_kmz.sh / lidar_hillshade_kml.sh.
+# Shared library for lidar hillshade pipeline scripts.
 # Source this file; do not execute it directly.
 #
-# Callers must set before sourcing or before calling functions:
-#   GIS_DIR        — root GIS data directory (from environment)
-#   FRAG_DIR       — temp dir for per-project KML fragments (caller owns cleanup)
+# Required (must be set in environment before sourcing):
+#   GIS_DIR               — root GIS data directory
 #
-# Callers must define:
-#   tile_href()    — takes BASENAME, echoes the <href> string for that tile
-#                    e.g. KMZ: "tiles/${1}.png"
-#                         KML: "file://${PNG_DIR}/${1}.png"
+# Required (caller must define as a function):
+#   tile_href <BASENAME>  — echoes the <href> value for a tile's PNG
+#                           KMZ: "tiles/${1}.png"
+#                           KML: "file://${PNG_DIR}/${1}.png"
 
 [[ -n "${_LIDAR_COMMON_LOADED:-}" ]] && return 0
 _LIDAR_COMMON_LOADED=1
 
-# ─── Validate environment ─────────────────────────────────────────────────────
+# ─── Validate required environment ───────────────────────────────────────────
 : "${GIS_DIR:?GIS_DIR is not set — add 'export GIS_DIR=/mnt/data/gis' to ~/.bashrc}"
 
 # ─── Directory layout ─────────────────────────────────────────────────────────
@@ -28,10 +27,11 @@ PNG_DIR="${TILES_BASE}/png"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 # ─── GDAL via QGIS flatpak ───────────────────────────────────────────────────
-GDALINFO=(flatpak run --command=gdalinfo org.qgis.qgis)
-GDALDEM=(flatpak run --command=gdaldem org.qgis.qgis)
-GDALWARP=(flatpak run --command=gdalwarp org.qgis.qgis)
-GDALTRANSLATE=(flatpak run --command=gdal_translate org.qgis.qgis)
+GDAL_FLATPAK_APP="org.qgis.qgis"
+GDALINFO=(flatpak run --command=gdalinfo      "${GDAL_FLATPAK_APP}")
+GDALDEM=(flatpak  run --command=gdaldem       "${GDAL_FLATPAK_APP}")
+GDALWARP=(flatpak run --command=gdalwarp      "${GDAL_FLATPAK_APP}")
+GDALTRANSLATE=(flatpak run --command=gdal_translate "${GDAL_FLATPAK_APP}")
 
 # ─── Hillshade parameters ────────────────────────────────────────────────────
 AZIMUTH=315
@@ -48,7 +48,7 @@ human_bytes() {
   fi
 }
 
-# ─── Step 1: check_deps <download_list> [extra_cmd...] ───────────────────────
+# ─── Step 1: check_deps_and_input <download_list> [extra_cmd...] ─────────────
 # Sets: DOWNLOAD_LIST FILTERED_LIST TOTAL_TILES
 check_deps_and_input() {
   local download_list="$1"; shift
@@ -68,7 +68,8 @@ check_deps_and_input() {
   for dep in "${extra_deps[@]+"${extra_deps[@]}"}"; do
     command -v "${dep}" >/dev/null || { echo "ERROR: ${dep} not found"; exit 1; }
   done
-  flatpak list | grep -q "org.qgis.qgis" || { echo "ERROR: QGIS flatpak not installed"; exit 1; }
+  flatpak list | grep -q "${GDAL_FLATPAK_APP}" \
+    || { echo "ERROR: flatpak app '${GDAL_FLATPAK_APP}' not installed"; exit 1; }
 
   if [[ ! -d "${LIDAR_DIR}" ]]; then
     echo "ERROR: Lidar dir not found: ${LIDAR_DIR}"
@@ -299,15 +300,25 @@ OVERLAY
 
 # ─── assemble_kml <output_path> ──────────────────────────────────────────────
 # Requires: FRAG_DIR (set by caller)
+# KML document name is derived from the project names found in FRAG_DIR.
 assemble_kml() {
   local KML_OUT="$1"
 
-  cat > "${KML_OUT}" <<'KMLHEADER'
+  # Derive document name from the projects actually present in the fragments
+  local PROJECTS=()
+  shopt -s nullglob
+  for f in "${FRAG_DIR}"/*.xml; do
+    PROJECTS+=("$(basename "${f}" .xml)")
+  done
+  shopt -u nullglob
+  local DOC_NAME
+  DOC_NAME=$(IFS=', '; echo "${PROJECTS[*]:-LiDAR Hillshade}")
+
+  cat > "${KML_OUT}" <<KMLHEADER
 <?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
 <Document>
-  <name>USGS LiDAR Hillshade</name>
-  <description>USGS QL1 LiDAR hillshade — 0.5m resolution</description>
+  <name>${DOC_NAME}</name>
 KMLHEADER
 
   shopt -s nullglob
