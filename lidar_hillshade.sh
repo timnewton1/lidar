@@ -65,34 +65,37 @@ echo "=========================================="
 LISTS_DIR="${WORK_DIR}/project_lists"
 mkdir -p "${LISTS_DIR}"
 
+declare -A PROJECT_COUNT=()
 MISSING=0
+SKIPPED_NO_PROJECT=0
 while IFS= read -r URL; do
   [[ -z "${URL}" ]] && continue
-  BASENAME=$(basename "${URL}" .tif)
+  BASENAME="${URL##*/}"; BASENAME="${BASENAME%.tif}"
   WGS84_TIF="${WGS84_DIR}/${BASENAME}_wgs84.tif"
   if [[ ! -f "${WGS84_TIF}" ]]; then
     MISSING=$((MISSING + 1))
     continue
   fi
-  # Project name lives between "Projects/" and the next slash in the URL
-  PROJECT=$(echo "${URL}" | grep -oP '(?<=Projects/)[^/]+' || echo "Unknown")
+  PROJECT=$(project_from_url "${URL}")
+  if [[ -z "${PROJECT}" ]]; then
+    SKIPPED_NO_PROJECT=$((SKIPPED_NO_PROJECT + 1))
+    echo "  WARNING: no Projects/<name>/ segment in URL — skipping: ${URL}"
+    continue
+  fi
   echo "${WGS84_TIF}" >> "${LISTS_DIR}/${PROJECT}.list"
+  PROJECT_COUNT["${PROJECT}"]=$((${PROJECT_COUNT["${PROJECT}"]:-0} + 1))
 done < "${FILTERED_LIST}"
 
-shopt -s nullglob
-PROJECT_LISTS=("${LISTS_DIR}"/*.list)
-shopt -u nullglob
+mapfile -t PROJECT_NAMES < <(printf '%s\n' "${!PROJECT_COUNT[@]}" | sort)
 
-if [[ ${#PROJECT_LISTS[@]} -eq 0 ]]; then
-  echo "ERROR: no WGS84 tiles available to mosaic (${MISSING} missing)"
+if [[ ${#PROJECT_NAMES[@]} -eq 0 ]]; then
+  echo "ERROR: no WGS84 tiles available to mosaic (${MISSING} missing, ${SKIPPED_NO_PROJECT} skipped)"
   exit 1
 fi
 
-echo "  Projects found: ${#PROJECT_LISTS[@]}  (${MISSING} tiles missing)"
-for LIST in "${PROJECT_LISTS[@]}"; do
-  PROJECT=$(basename "${LIST}" .list)
-  COUNT=$(wc -l < "${LIST}")
-  printf "    %-60s %5d tiles\n" "${PROJECT}" "${COUNT}"
+echo "  Projects found: ${#PROJECT_NAMES[@]}  (${MISSING} missing, ${SKIPPED_NO_PROJECT} skipped)"
+for PROJECT in "${PROJECT_NAMES[@]}"; do
+  printf "    %-60s %5d tiles\n" "${PROJECT}" "${PROJECT_COUNT[${PROJECT}]}"
 done
 
 # ─── Step 6: Per-project VRT + gdal2tiles super-overlay ──────────────────────
@@ -103,33 +106,23 @@ echo "=========================================="
 mkdir -p "${OUT_DIR}"
 PROCESSES=$(nproc 2>/dev/null || echo 4)
 
-PROJECT_NAMES=()
-for LIST in "${PROJECT_LISTS[@]}"; do
-  PROJECT=$(basename "${LIST}" .list)
-  PROJECT_NAMES+=("${PROJECT}")
-  COUNT=$(wc -l < "${LIST}")
-
-  echo "------------------------------------------"
-  echo "Project: ${PROJECT}  (${COUNT} tiles)"
-  echo "------------------------------------------"
-
+for PROJECT in "${PROJECT_NAMES[@]}"; do
+  LIST="${LISTS_DIR}/${PROJECT}.list"
   VRT="${WORK_DIR}/${PROJECT}.vrt"
   PROJ_OUT="${OUT_DIR}/${PROJECT}"
   mkdir -p "${PROJ_OUT}"
 
-  set -x
+  echo "------------------------------------------"
+  echo "Project: ${PROJECT}  (${PROJECT_COUNT[${PROJECT}]} tiles)"
+  echo "------------------------------------------"
+
   "${GDALBUILDVRT[@]}" -input_file_list "${LIST}" "${VRT}"
-  # -t TITLE sets the sub-doc.kml's <name> so GE's sidebar shows the project
-  # name instead of "mosaic.vrt".
+  # -t sets the sub-doc.kml <name> so GE's sidebar shows the project name
   "${GDAL2TILES[@]}" \
-    -p geodetic \
-    -k \
-    -r average \
+    -p geodetic -k -r average \
     -t "${PROJECT}" \
     --processes="${PROCESSES}" \
-    "${VRT}" \
-    "${PROJ_OUT}"
-  set +x
+    "${VRT}" "${PROJ_OUT}"
 done
 
 # ─── Step 7: Write root doc.kml with NetworkLinks to each project ────────────

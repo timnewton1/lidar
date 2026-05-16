@@ -36,13 +36,14 @@ ALTITUDE=45
 Z_FACTOR=1.5
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
-human_bytes() {
-  local b=$1
-  if   [[ $b -ge 1073741824 ]]; then printf "%.2f GB" "$(echo "scale=2; $b/1073741824" | bc)"
-  elif [[ $b -ge 1048576    ]]; then printf "%.1f MB" "$(echo "scale=1; $b/1048576"    | bc)"
-  elif [[ $b -ge 1024       ]]; then printf "%.1f KB" "$(echo "scale=1; $b/1024"       | bc)"
-  else printf "%d B" "$b"
-  fi
+human_bytes() { numfmt --to=iec --suffix=B --format='%.1f' "$1"; }
+
+# Extract USGS project name from URL: ".../Projects/<NAME>/..." → "<NAME>"
+# Echoes empty string if URL doesn't match.
+project_from_url() {
+  local rest="${1#*/Projects/}"
+  [[ "${rest}" == "$1" ]] && { echo ""; return; }
+  echo "${rest%%/*}"
 }
 
 # ─── Step 1: check_deps_and_input <download_list> [extra_cmd...] ─────────────
@@ -60,8 +61,8 @@ check_deps_and_input() {
     exit 1
   fi
 
-  command -v curl >/dev/null || { echo "ERROR: curl not found"; exit 1; }
-  command -v bc   >/dev/null || { echo "ERROR: bc not found — sudo dnf install bc"; exit 1; }
+  command -v curl   >/dev/null || { echo "ERROR: curl not found"; exit 1; }
+  command -v numfmt >/dev/null || { echo "ERROR: numfmt not found (coreutils)"; exit 1; }
   for dep in "${extra_deps[@]+"${extra_deps[@]}"}"; do
     command -v "${dep}" >/dev/null || { echo "ERROR: ${dep} not found"; exit 1; }
   done
@@ -104,8 +105,7 @@ prescan() {
 
   while IFS= read -r URL; do
     [[ -z "${URL}" ]] && continue
-    local BASENAME
-    BASENAME=$(basename "${URL}" .tif)
+    local BASENAME="${URL##*/}"; BASENAME="${BASENAME%.tif}"
     local TILE_TIF="${DEM_DIR}/${BASENAME}.tif"
     if [[ -f "${TILE_TIF}" ]]; then
       local SIZE
@@ -129,11 +129,8 @@ prescan() {
       SCAN_N=$((SCAN_N + 1))
       printf "\r  HEAD %d/%d..." "${SCAN_N}" "${TILES_PENDING}"
       local SIZE
-      SIZE=$(curl -sI "${URL}" \
-             | grep -i '^content-length:' \
-             | awk '{print $2}' | tr -d '\r' || echo 0)
-      SIZE=${SIZE:-0}
-      BYTES_TOTAL=$((BYTES_TOTAL + SIZE))
+      SIZE=$(curl -sI "${URL}" | awk 'tolower($1)=="content-length:" {gsub(/\r/,""); print $2}' || true)
+      BYTES_TOTAL=$((BYTES_TOTAL + ${SIZE:-0}))
     done
     echo ""
   fi
@@ -163,11 +160,21 @@ process_tiles() {
   local ERRORS=0
   local BYTES_DOWNLOADED="${BYTES_DONE}"
 
+  local fetch_dem hillshade_dem
+  fetch_dem() {
+    curl -f -L --retry 3 --retry-delay 5 -# -o "$1" "$2"
+  }
+  hillshade_dem() {
+    "${GDALDEM[@]}" hillshade "$1" "$2" \
+      -az "${AZIMUTH}" -alt "${ALTITUDE}" -z "${Z_FACTOR}" \
+      -alg ZevenbergenThorne -combined \
+      -co COMPRESS=DEFLATE -co TILED=YES
+  }
+
   while IFS= read -r URL; do
     [[ -z "${URL}" ]] && continue
 
-    local BASENAME
-    BASENAME=$(basename "${URL}" .tif)
+    local BASENAME="${URL##*/}"; BASENAME="${BASENAME%.tif}"
     local TILE_TIF="${DEM_DIR}/${BASENAME}.tif"
     local HILL_TIF="${HILLSHADE_DIR}/${BASENAME}_hillshade.tif"
     local WGS84_TIF="${WGS84_DIR}/${BASENAME}_wgs84.tif"
@@ -181,45 +188,35 @@ process_tiles() {
       echo "  [SKIP] Already downloaded"
     else
       echo "  Downloading... [$(human_bytes "${BYTES_DOWNLOADED}") / $(human_bytes "${BYTES_TOTAL}") total]"
-      set -x
-      curl -f -L --retry 3 --retry-delay 5 -# -o "${TILE_TIF}" "${URL}"
-      set +x
+      fetch_dem "${TILE_TIF}" "${URL}"
       local TILE_SIZE
       TILE_SIZE=$(stat -c %s "${TILE_TIF}")
       BYTES_DOWNLOADED=$((BYTES_DOWNLOADED + TILE_SIZE))
       echo "  Downloaded $(human_bytes "${TILE_SIZE}") — total so far: $(human_bytes "${BYTES_DOWNLOADED}") / $(human_bytes "${BYTES_TOTAL}")"
     fi
 
-    # 4b: Hillshade — retry once on corrupt tile
-    if [[ -f "${HILL_TIF}" ]]; then
-      echo "  [SKIP] Hillshade exists"
-    else
-      echo "  Generating hillshade..."
-      set -x
-      if ! "${GDALDEM[@]}" hillshade "${TILE_TIF}" "${HILL_TIF}" \
-          -az "${AZIMUTH}" -alt "${ALTITUDE}" -z "${Z_FACTOR}" \
-          -alg ZevenbergenThorne -combined \
-          -co COMPRESS=DEFLATE -co TILED=YES; then
-        set +x
-        echo "  WARNING: corrupt tile — re-downloading and retrying..."
-        rm -f "${TILE_TIF}" "${HILL_TIF}"
-        set -x
-        curl -f -L --retry 3 --retry-delay 5 -# -o "${TILE_TIF}" "${URL}"
-        if ! "${GDALDEM[@]}" hillshade "${TILE_TIF}" "${HILL_TIF}" \
-            -az "${AZIMUTH}" -alt "${ALTITUDE}" -z "${Z_FACTOR}" \
-            -alg ZevenbergenThorne -combined \
-            -co COMPRESS=DEFLATE -co TILED=YES; then
-          set +x
-          echo "  ERROR: hillshade failed twice — skipping ${BASENAME}"
-          rm -f "${HILL_TIF}"
-          ERRORS=$((ERRORS + 1))
-          PROCESSED=$((PROCESSED + 1))
-          continue
+    # 4b: Hillshade — retry once on corrupt tile by re-downloading
+    if [[ ! -f "${HILL_TIF}" ]]; then
+      local attempt success=0
+      for attempt in 1 2; do
+        echo "  Generating hillshade (attempt ${attempt}/2)..."
+        if hillshade_dem "${TILE_TIF}" "${HILL_TIF}"; then
+          success=1
+          break
         fi
-        set +x
-      else
-        set +x
+        echo "  WARNING: hillshade failed — re-downloading tile and retrying..."
+        rm -f "${TILE_TIF}" "${HILL_TIF}"
+        fetch_dem "${TILE_TIF}" "${URL}"
+      done
+      if [[ ${success} -eq 0 ]]; then
+        echo "  ERROR: hillshade failed twice — skipping ${BASENAME}"
+        rm -f "${HILL_TIF}"
+        ERRORS=$((ERRORS + 1))
+        PROCESSED=$((PROCESSED + 1))
+        continue
       fi
+    else
+      echo "  [SKIP] Hillshade exists"
     fi
 
     # 4c: Reproject to WGS84
@@ -227,10 +224,8 @@ process_tiles() {
       echo "  [SKIP] WGS84 exists"
     else
       echo "  Reprojecting to WGS84..."
-      set -x
       "${GDALWARP[@]}" -t_srs EPSG:4326 -r bilinear -co COMPRESS=DEFLATE \
         "${HILL_TIF}" "${WGS84_TIF}"
-      set +x
     fi
 
     PROCESSED=$((PROCESSED + 1))
