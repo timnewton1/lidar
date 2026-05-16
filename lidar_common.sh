@@ -1,53 +1,41 @@
 #!/usr/bin/env bash
-# Shared library for lidar hillshade pipeline scripts.
+# Shared library for the lidar hillshade pipeline.
 # Source this file; do not execute it directly.
 #
+# Pipeline produces WGS84 hillshade GeoTIFFs ready to be fed into a
+# super-overlay generator (gdal2tiles / gdal_translate KMLSUPEROVERLAY).
+# All KML/KMZ packaging is the caller's responsibility.
+#
 # Required (must be set in environment before sourcing):
-#   GIS_DIR               — root GIS data directory
-#
-# Required (caller must define as a function):
-#   tile_png_href <BASENAME>  — echoes the PNG <href> written inside each per-tile KML
-#                               KMZ: "BASENAME.png"   (relative, same dir as tile KML)
-#                               KML: "file:///abs/path/BASENAME.png"
-#
-# Required (caller must set as a variable):
-#   TILE_KMLS_DIR         — directory where per-tile KML files are written
-#                           KMZ: "$STAGE_DIR/tiles"   (staged into the ZIP)
-#                           KML: "$KML_DIR/tiles"      (persistent, referenced by root KML)
+#   GIS_DIR  — root GIS data directory (e.g. /mnt/data/gis)
 
 [[ -n "${_LIDAR_COMMON_LOADED:-}" ]] && return 0
 _LIDAR_COMMON_LOADED=1
 
-# ─── Validate required environment ───────────────────────────────────────────
 : "${GIS_DIR:?GIS_DIR is not set — add 'export GIS_DIR=/mnt/data/gis' to ~/.bashrc}"
 
-# ─── Directory layout ─────────────────────────────────────────────────────────
+# ─── Directory layout ────────────────────────────────────────────────────────
 LIDAR_DIR="${GIS_DIR}/lidar"
 TILES_BASE="${LIDAR_DIR}/tiles"
 DEM_DIR="${TILES_BASE}/dem"
 HILLSHADE_DIR="${TILES_BASE}/hillshade"
 WGS84_DIR="${TILES_BASE}/wgs84"
-PNG_DIR="${TILES_BASE}/png"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 # ─── GDAL via QGIS flatpak ───────────────────────────────────────────────────
 GDAL_FLATPAK_APP="org.qgis.qgis"
-GDALINFO=(flatpak run --command=gdalinfo      "${GDAL_FLATPAK_APP}")
-GDALDEM=(flatpak  run --command=gdaldem       "${GDAL_FLATPAK_APP}")
-GDALWARP=(flatpak run --command=gdalwarp      "${GDAL_FLATPAK_APP}")
-GDALTRANSLATE=(flatpak run --command=gdal_translate "${GDAL_FLATPAK_APP}")
+GDALDEM=(flatpak       run --command=gdaldem        "${GDAL_FLATPAK_APP}")
+GDALWARP=(flatpak      run --command=gdalwarp       "${GDAL_FLATPAK_APP}")
+GDALBUILDVRT=(flatpak  run --command=gdalbuildvrt   "${GDAL_FLATPAK_APP}")
+GDAL2TILES=(flatpak    run --command=gdal2tiles.py  "${GDAL_FLATPAK_APP}")
 
 # ─── Hillshade parameters ────────────────────────────────────────────────────
 AZIMUTH=315
 ALTITUDE=45
 Z_FACTOR=1.5
 
-# ─── LoD parameters ──────────────────────────────────────────────────────────
-LOD_MIN_PIXELS=128   # tile loads when it covers this many screen pixels
-LOD_MAX_PIXELS=-1    # -1 = no upper limit (never unloads once in range)
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 human_bytes() {
   local b=$1
   if   [[ $b -ge 1073741824 ]]; then printf "%.2f GB" "$(echo "scale=2; $b/1073741824" | bc)"
@@ -101,7 +89,7 @@ check_deps_and_input() {
   echo "Tiles found: ${TOTAL_TILES}"
 }
 
-# ─── Step 2: prescan ──────────────────────────────────────────────────────────
+# ─── Step 2: prescan ─────────────────────────────────────────────────────────
 # Sets: BYTES_DONE BYTES_TOTAL TILES_CACHED TILES_PENDING PENDING_URLS
 prescan() {
   echo "=========================================="
@@ -160,13 +148,12 @@ make_dirs() {
   echo "=========================================="
   echo "STEP 3: Creating output directories"
   echo "=========================================="
-  mkdir -p "${DEM_DIR}" "${HILLSHADE_DIR}" "${WGS84_DIR}" "${PNG_DIR}" "$@"
+  mkdir -p "${DEM_DIR}" "${HILLSHADE_DIR}" "${WGS84_DIR}" "$@"
 }
 
 # ─── Step 4: process_tiles ───────────────────────────────────────────────────
-# Requires: FRAG_DIR TILE_KMLS_DIR (set by caller), tile_png_href() (defined by caller)
-# Writes:   $TILE_KMLS_DIR/BASENAME.kml   — per-tile KML with GroundOverlay
-#           $FRAG_DIR/PROJECT.xml          — NetworkLink fragments for root KML
+# For each URL in FILTERED_LIST: download DEM → generate hillshade → reproject
+# to WGS84. Each step is cached on disk and skipped if already done.
 process_tiles() {
   echo "=========================================="
   echo "STEP 4: Processing ${TOTAL_TILES} tiles"
@@ -184,8 +171,6 @@ process_tiles() {
     local TILE_TIF="${DEM_DIR}/${BASENAME}.tif"
     local HILL_TIF="${HILLSHADE_DIR}/${BASENAME}_hillshade.tif"
     local WGS84_TIF="${WGS84_DIR}/${BASENAME}_wgs84.tif"
-    local PNG_FILE="${PNG_DIR}/${BASENAME}.png"
-    local TILE_KML="${TILE_KMLS_DIR}/${BASENAME}.kml"
 
     echo "------------------------------------------"
     echo "Tile $((PROCESSED + 1))/${TOTAL_TILES}: ${BASENAME}"
@@ -248,95 +233,6 @@ process_tiles() {
       set +x
     fi
 
-    # 4d: Convert to PNG
-    if [[ -f "${PNG_FILE}" ]]; then
-      echo "  [SKIP] PNG exists"
-    else
-      echo "  Converting to PNG..."
-      set -x
-      "${GDALTRANSLATE[@]}" -of PNG "${WGS84_TIF}" "${PNG_FILE}"
-      set +x
-    fi
-
-    # 4e: Read bbox (.bbox sidecar; written on first process to avoid repeated flatpak calls)
-    local BBOX_FILE="${WGS84_DIR}/${BASENAME}.bbox"
-    local WEST NORTH EAST SOUTH
-    if [[ -f "${BBOX_FILE}" ]]; then
-      read -r NORTH SOUTH EAST WEST < "${BBOX_FILE}"
-    else
-      local GINFO
-      GINFO=$("${GDALINFO[@]}" "${WGS84_TIF}")
-      local UL LR
-      UL=$(echo "${GINFO}" | grep "Upper Left"  | grep -oP '\(\s*[-0-9.]+,\s*[-0-9.]+\)' || true)
-      LR=$(echo "${GINFO}" | grep "Lower Right" | grep -oP '\(\s*[-0-9.]+,\s*[-0-9.]+\)' || true)
-      WEST=$(echo  "${UL}" | grep -oP '[-0-9.]+' | head -1 || true)
-      NORTH=$(echo "${UL}" | grep -oP '[-0-9.]+' | tail -1 || true)
-      EAST=$(echo  "${LR}" | grep -oP '[-0-9.]+' | head -1 || true)
-      SOUTH=$(echo "${LR}" | grep -oP '[-0-9.]+' | tail -1 || true)
-      if [[ -n "${NORTH}" && -n "${SOUTH}" && -n "${EAST}" && -n "${WEST}" ]]; then
-        echo "${NORTH} ${SOUTH} ${EAST} ${WEST}" > "${BBOX_FILE}"
-      fi
-    fi
-
-    if [[ -z "${WEST}" || -z "${NORTH}" || -z "${EAST}" || -z "${SOUTH}" ]]; then
-      echo "  WARNING: Could not read bbox — skipping KML entry"
-      ERRORS=$((ERRORS + 1))
-      PROCESSED=$((PROCESSED + 1))
-      continue
-    fi
-
-    echo "  BBox: N=${NORTH} S=${SOUTH} E=${EAST} W=${WEST}"
-
-    # 4f: Write per-tile KML (skip if already written)
-    if [[ ! -f "${TILE_KML}" ]]; then
-      local PNG_HREF
-      PNG_HREF=$(tile_png_href "${BASENAME}")
-      cat > "${TILE_KML}" <<TILEKML
-<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2">
-<GroundOverlay>
-  <name>${BASENAME}</name>
-  <Icon><href>${PNG_HREF}</href></Icon>
-  <LatLonBox>
-    <north>${NORTH}</north>
-    <south>${SOUTH}</south>
-    <east>${EAST}</east>
-    <west>${WEST}</west>
-  </LatLonBox>
-</GroundOverlay>
-</kml>
-TILEKML
-    else
-      echo "  [SKIP] Tile KML exists"
-    fi
-
-    # 4g: Append NetworkLink fragment for root KML (grouped by project)
-    local PROJECT
-    PROJECT=$(echo "${URL}" | grep -oP '(?<=Projects/)[^/]+' || echo "Unknown")
-    local FRAG_FILE="${FRAG_DIR}/${PROJECT}.xml"
-
-    cat >> "${FRAG_FILE}" <<NETWORKLINK
-    <NetworkLink>
-      <name>${BASENAME}</name>
-      <Region>
-        <LatLonAltBox>
-          <north>${NORTH}</north>
-          <south>${SOUTH}</south>
-          <east>${EAST}</east>
-          <west>${WEST}</west>
-        </LatLonAltBox>
-        <Lod>
-          <minLodPixels>${LOD_MIN_PIXELS}</minLodPixels>
-          <maxLodPixels>${LOD_MAX_PIXELS}</maxLodPixels>
-        </Lod>
-      </Region>
-      <Link>
-        <href>tiles/${BASENAME}.kml</href>
-        <viewRefreshMode>onRegion</viewRefreshMode>
-      </Link>
-    </NetworkLink>
-NETWORKLINK
-
     PROCESSED=$((PROCESSED + 1))
     echo "  Done"
 
@@ -347,42 +243,22 @@ NETWORKLINK
   echo "=========================================="
 }
 
-# ─── assemble_kml <output_path> ──────────────────────────────────────────────
-# Requires: FRAG_DIR (set by caller)
-# KML document name is derived from the project names found in FRAG_DIR.
-assemble_kml() {
-  local KML_OUT="$1"
-
-  local PROJECTS=()
-  shopt -s nullglob
-  for f in "${FRAG_DIR}"/*.xml; do
-    PROJECTS+=("$(basename "${f}" .xml)")
-  done
-  shopt -u nullglob
-  local DOC_NAME
-  DOC_NAME=$(IFS=', '; echo "${PROJECTS[*]:-LiDAR Hillshade}")
-
-  cat > "${KML_OUT}" <<KMLHEADER
-<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2">
-<Document>
-  <name>${DOC_NAME}</name>
-KMLHEADER
-
-  shopt -s nullglob
-  for FRAG_FILE in "${FRAG_DIR}"/*.xml; do
-    local PROJECT_NAME
-    PROJECT_NAME=$(basename "${FRAG_FILE}" .xml)
-    echo "  <Folder>" >> "${KML_OUT}"
-    echo "    <name>${PROJECT_NAME}</name>" >> "${KML_OUT}"
-    echo "    <visibility>1</visibility>" >> "${KML_OUT}"
-    cat "${FRAG_FILE}" >> "${KML_OUT}"
-    echo "  </Folder>" >> "${KML_OUT}"
-  done
-  shopt -u nullglob
-
-  cat >> "${KML_OUT}" <<'KMLFOOTER'
-</Document>
-</kml>
-KMLFOOTER
+# ─── build_wgs84_list <output_file> ──────────────────────────────────────────
+# Writes one absolute path per line for each cached WGS84 GeoTIFF in FILTERED_LIST.
+# Returns the number of tiles in the list via stdout.
+build_wgs84_list() {
+  local out="$1"
+  : > "${out}"
+  local n=0
+  while IFS= read -r URL; do
+    [[ -z "${URL}" ]] && continue
+    local BASENAME
+    BASENAME=$(basename "${URL}" .tif)
+    local WGS84_TIF="${WGS84_DIR}/${BASENAME}_wgs84.tif"
+    if [[ -f "${WGS84_TIF}" ]]; then
+      echo "${WGS84_TIF}" >> "${out}"
+      n=$((n + 1))
+    fi
+  done < "${FILTERED_LIST}"
+  echo "${n}"
 }
