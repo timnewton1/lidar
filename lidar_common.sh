@@ -6,9 +6,14 @@
 #   GIS_DIR               — root GIS data directory
 #
 # Required (caller must define as a function):
-#   tile_href <BASENAME>  — echoes the <href> value for a tile's PNG
-#                           KMZ: "tiles/${1}.png"
-#                           KML: "file://${PNG_DIR}/${1}.png"
+#   tile_png_href <BASENAME>  — echoes the PNG <href> written inside each per-tile KML
+#                               KMZ: "BASENAME.png"   (relative, same dir as tile KML)
+#                               KML: "file:///abs/path/BASENAME.png"
+#
+# Required (caller must set as a variable):
+#   TILE_KMLS_DIR         — directory where per-tile KML files are written
+#                           KMZ: "$STAGE_DIR/tiles"   (staged into the ZIP)
+#                           KML: "$KML_DIR/tiles"      (persistent, referenced by root KML)
 
 [[ -n "${_LIDAR_COMMON_LOADED:-}" ]] && return 0
 _LIDAR_COMMON_LOADED=1
@@ -37,6 +42,10 @@ GDALTRANSLATE=(flatpak run --command=gdal_translate "${GDAL_FLATPAK_APP}")
 AZIMUTH=315
 ALTITUDE=45
 Z_FACTOR=1.5
+
+# ─── LoD parameters ──────────────────────────────────────────────────────────
+LOD_MIN_PIXELS=128   # tile loads when it covers this many screen pixels
+LOD_MAX_PIXELS=-1    # -1 = no upper limit (never unloads once in range)
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 human_bytes() {
@@ -155,7 +164,9 @@ make_dirs() {
 }
 
 # ─── Step 4: process_tiles ───────────────────────────────────────────────────
-# Requires: FRAG_DIR (set by caller), tile_href() (defined by caller)
+# Requires: FRAG_DIR TILE_KMLS_DIR (set by caller), tile_png_href() (defined by caller)
+# Writes:   $TILE_KMLS_DIR/BASENAME.kml   — per-tile KML with GroundOverlay
+#           $FRAG_DIR/PROJECT.xml          — NetworkLink fragments for root KML
 process_tiles() {
   echo "=========================================="
   echo "STEP 4: Processing ${TOTAL_TILES} tiles"
@@ -174,6 +185,7 @@ process_tiles() {
     local HILL_TIF="${HILLSHADE_DIR}/${BASENAME}_hillshade.tif"
     local WGS84_TIF="${WGS84_DIR}/${BASENAME}_wgs84.tif"
     local PNG_FILE="${PNG_DIR}/${BASENAME}.png"
+    local TILE_KML="${TILE_KMLS_DIR}/${BASENAME}.kml"
 
     echo "------------------------------------------"
     echo "Tile $((PROCESSED + 1))/${TOTAL_TILES}: ${BASENAME}"
@@ -246,7 +258,7 @@ process_tiles() {
       set +x
     fi
 
-    # 4e: Extract bbox (cached in .bbox sidecar to avoid repeated flatpak calls)
+    # 4e: Read bbox (.bbox sidecar; written on first process to avoid repeated flatpak calls)
     local BBOX_FILE="${WGS84_DIR}/${BASENAME}.bbox"
     local WEST NORTH EAST SOUTH
     if [[ -f "${BBOX_FILE}" ]]; then
@@ -267,7 +279,7 @@ process_tiles() {
     fi
 
     if [[ -z "${WEST}" || -z "${NORTH}" || -z "${EAST}" || -z "${SOUTH}" ]]; then
-      echo "  WARNING: Could not parse bbox — skipping KML entry"
+      echo "  WARNING: Could not read bbox — skipping KML entry"
       ERRORS=$((ERRORS + 1))
       PROCESSED=$((PROCESSED + 1))
       continue
@@ -275,27 +287,55 @@ process_tiles() {
 
     echo "  BBox: N=${NORTH} S=${SOUTH} E=${EAST} W=${WEST}"
 
+    # 4f: Write per-tile KML (skip if already written)
+    if [[ ! -f "${TILE_KML}" ]]; then
+      local PNG_HREF
+      PNG_HREF=$(tile_png_href "${BASENAME}")
+      cat > "${TILE_KML}" <<TILEKML
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<GroundOverlay>
+  <name>${BASENAME}</name>
+  <Icon><href>${PNG_HREF}</href></Icon>
+  <LatLonBox>
+    <north>${NORTH}</north>
+    <south>${SOUTH}</south>
+    <east>${EAST}</east>
+    <west>${WEST}</west>
+  </LatLonBox>
+</GroundOverlay>
+</kml>
+TILEKML
+    else
+      echo "  [SKIP] Tile KML exists"
+    fi
+
+    # 4g: Append NetworkLink fragment for root KML (grouped by project)
     local PROJECT
     PROJECT=$(echo "${URL}" | grep -oP '(?<=Projects/)[^/]+' || echo "Unknown")
     local FRAG_FILE="${FRAG_DIR}/${PROJECT}.xml"
-    local HREF
-    HREF=$(tile_href "${BASENAME}")
 
-    cat >> "${FRAG_FILE}" <<OVERLAY
-    <GroundOverlay>
+    cat >> "${FRAG_FILE}" <<NETWORKLINK
+    <NetworkLink>
       <name>${BASENAME}</name>
-      <visibility>1</visibility>
-      <Icon>
-        <href>${HREF}</href>
-      </Icon>
-      <LatLonBox>
-        <north>${NORTH}</north>
-        <south>${SOUTH}</south>
-        <east>${EAST}</east>
-        <west>${WEST}</west>
-      </LatLonBox>
-    </GroundOverlay>
-OVERLAY
+      <Region>
+        <LatLonAltBox>
+          <north>${NORTH}</north>
+          <south>${SOUTH}</south>
+          <east>${EAST}</east>
+          <west>${WEST}</west>
+        </LatLonAltBox>
+        <Lod>
+          <minLodPixels>${LOD_MIN_PIXELS}</minLodPixels>
+          <maxLodPixels>${LOD_MAX_PIXELS}</maxLodPixels>
+        </Lod>
+      </Region>
+      <Link>
+        <href>tiles/${BASENAME}.kml</href>
+        <viewRefreshMode>onRegion</viewRefreshMode>
+      </Link>
+    </NetworkLink>
+NETWORKLINK
 
     PROCESSED=$((PROCESSED + 1))
     echo "  Done"
@@ -313,7 +353,6 @@ OVERLAY
 assemble_kml() {
   local KML_OUT="$1"
 
-  # Derive document name from the projects actually present in the fragments
   local PROJECTS=()
   shopt -s nullglob
   for f in "${FRAG_DIR}"/*.xml; do
