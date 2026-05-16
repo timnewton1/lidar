@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Usage: lidar_hillshade_kmz.sh <downloadlist.txt>
 #
-# Downloads LiDAR tiles, generates hillshades, and packages everything
-# into a self-contained KMZ for use in Google Earth Pro.
+# Packages a self-contained KMZ using NetworkLink + Region/LoD tiling.
+# Tiles load on demand as you navigate.
 #
 # Requires GIS_DIR env var (set in ~/.bashrc):
 #   export GIS_DIR="/mnt/data/gis"
@@ -24,10 +24,12 @@ KMZ_OUT="${KMZ_DIR}/lidar_hillshade_${TIMESTAMP}.kmz"
 
 STAGE_DIR=$(mktemp -d /tmp/kmz_stage_XXXXXX)
 FRAG_DIR="${STAGE_DIR}/fragments"
+TILE_KMLS_DIR="${STAGE_DIR}/tiles"
 trap 'rm -rf "${STAGE_DIR}"' EXIT
-mkdir -p "${STAGE_DIR}/tiles" "${FRAG_DIR}"
+mkdir -p "${FRAG_DIR}" "${TILE_KMLS_DIR}"
 
-tile_href() { echo "tiles/${1}.png"; }
+# PNG href is relative: per-tile KMLs and PNGs both live in tiles/ inside the KMZ
+tile_png_href() { echo "${1}.png"; }
 
 check_deps_and_input "$1" zip
 prescan
@@ -41,16 +43,17 @@ echo "=========================================="
 
 assemble_kml "${STAGE_DIR}/doc.kml"
 
+# Stage PNGs alongside their tile KMLs
 while IFS= read -r URL; do
   [[ -z "${URL}" ]] && continue
   BASENAME=$(basename "${URL}" .tif)
   PNG_FILE="${PNG_DIR}/${BASENAME}.png"
-  [[ -f "${PNG_FILE}" ]] && cp "${PNG_FILE}" "${STAGE_DIR}/tiles/"
+  [[ -f "${PNG_FILE}" ]] && cp "${PNG_FILE}" "${TILE_KMLS_DIR}/"
 done < "${FILTERED_LIST}"
 
 STAGED_PNGS=()
 shopt -s nullglob
-STAGED_PNGS+=("${STAGE_DIR}/tiles/"*.png)
+STAGED_PNGS+=("${TILE_KMLS_DIR}/"*.png)
 shopt -u nullglob
 
 if [[ ${#STAGED_PNGS[@]} -eq 0 ]]; then
@@ -68,6 +71,6 @@ echo "KMZ : ${KMZ_OUT}"
 echo "Size: $(human_bytes "$(stat -c %s "${KMZ_OUT}")")"
 echo ""
 echo "Open in Google Earth Pro via File → Open"
+echo "  Tiles load on demand as you navigate (NetworkLink + Region/LoD)"
 echo "  Folder checkbox = toggle all tiles at once"
-echo "  Expand folder   = toggle individual tiles"
 echo "=========================================="
