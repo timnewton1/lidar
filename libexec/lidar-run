@@ -86,7 +86,7 @@ if [[ ${BACKGROUND} -eq 1 ]]; then
     fi
   else
     while true; do
-      LOG_NAME="superoverlay_$(date +%Y%m%d_%H%M%S)_$(tr -dc 'a-f0-9' < /dev/urandom | head -c 6)"
+      LOG_NAME="superoverlay_$(date +%Y%m%d_%H%M%S)_$(printf '%02x%02x%02x' $((RANDOM&255)) $((RANDOM&255)) $((RANDOM&255)))"
       LOG_FILE="${LOG_DIR}/${LOG_NAME}.log"
       [[ ! -e "${LOG_FILE}" ]] && break
     done
@@ -124,7 +124,7 @@ KML_DIR="${LIDAR_DIR}/kml"
 
 if [[ -z "${NAME}" ]]; then
   while true; do
-    NAME="superoverlay_$(date +%Y%m%d_%H%M%S)_$(tr -dc 'a-f0-9' < /dev/urandom | head -c 6)"
+    NAME="superoverlay_$(date +%Y%m%d_%H%M%S)_$(printf '%02x%02x%02x' $((RANDOM&255)) $((RANDOM&255)) $((RANDOM&255)))"
     [[ ! -e "${KML_DIR}/${NAME}" ]] && break
   done
 fi
