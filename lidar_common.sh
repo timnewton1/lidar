@@ -82,11 +82,6 @@ check_deps_and_input() {
   echo "STEP 1: Checking dependencies"
   echo "=========================================="
 
-  if [[ ! -f "${download_list}" ]]; then
-    echo "ERROR: File not found: ${download_list}"
-    exit 1
-  fi
-
   command -v curl   >/dev/null || { echo "ERROR: curl not found"; exit 1; }
   command -v numfmt >/dev/null || { echo "ERROR: numfmt not found (coreutils)"; exit 1; }
   for dep in "${extra_deps[@]+"${extra_deps[@]}"}"; do
@@ -98,6 +93,20 @@ check_deps_and_input() {
   if [[ ! -d "${LIDAR_DIR}" ]]; then
     echo "ERROR: Lidar dir not found: ${LIDAR_DIR}"
     echo "  Is ${GIS_DIR} mounted?"
+    exit 1
+  fi
+
+  # Accept either a local path or an http(s):// URL to a .txt of tile URLs.
+  if [[ "${download_list}" =~ ^https?:// ]]; then
+    local fetched="${LIDAR_DIR}/${download_list##*/}"
+    echo "  Fetching link list: ${download_list}"
+    curl -L --retry 5 --retry-all-errors --fail-with-body --max-time 120 \
+      -o "${fetched}.partial" "${download_list}" \
+      || { echo "ERROR: failed to fetch ${download_list}"; exit 1; }
+    mv -f "${fetched}.partial" "${fetched}"
+    download_list="${fetched}"
+  elif [[ ! -f "${download_list}" ]]; then
+    echo "ERROR: File not found: ${download_list}"
     exit 1
   fi
 
@@ -204,7 +213,7 @@ download_tiles() {
     # Atomic write: stream into .partial, rename on success. -C - resumes a
     # truncated .partial from prior run instead of restarting from byte 0.
     local PARTIAL="${TILE_TIF}.partial"
-    if ! curl -fL --retry 5 --retry-all-errors --retry-delay 5 \
+    if ! curl -L --retry 5 --retry-all-errors --retry-delay 5 \
               --fail-with-body --max-time 1800 -C - \
               -o "${PARTIAL}" "${URL}"; then
       echo "  ERROR: download failed for ${URL}" >&2

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: lidar_hillshade.sh [options] <downloadlist.txt>
+# Usage: lidar_hillshade.sh [options] <downloadlist.txt|URL>
 #
 # Options:
 #   --shading LIST       comma-separated shadings to render. Default: hillshade
