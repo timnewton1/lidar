@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+HERE=$(cd "$(dirname "$(realpath "$0")")" && pwd)
+export LIDAR_HOME="${HERE}"
+export PATH="${HERE}/libexec:${PATH}"
+
+sub="${1:-help}"; [[ $# -gt 0 ]] && shift
+
+case "${sub}" in
+  help|-h|--help)
+    exec "${HERE}/libexec/lidar-help" "$@" ;;
+  service)
+    sub2="${1:-}"
+    [[ -n "${sub2}" ]] || { echo "lidar service: requires install|uninstall" >&2; exit 2; }
+    shift
+    bin="${HERE}/libexec/lidar-service-${sub2}"
+    [[ -x "${bin}" ]] || { echo "lidar service: unknown action: ${sub2}" >&2; exit 2; }
+    exec "${bin}" "$@" ;;
+  *)
+    bin="${HERE}/libexec/lidar-${sub}"
+    [[ -x "${bin}" ]] || { echo "lidar: unknown subcommand: ${sub}" >&2; exit 2; }
+    exec "${bin}" "$@" ;;
+esac
