@@ -19,6 +19,8 @@
 #                        (auto-restarts, survives reboot). Forwards all other
 #                        flags + the URL/list to the unit's env file.
 #   --uninstall-service N  stop, disable, and remove service N's env file
+#   --kill-all           stop every active lidar run (background sidecars,
+#                        systemd lidar-hillshade@* units, stray processes)
 #   -h, --help           show this help
 #
 # Output: $GIS_DIR/lidar/kml/<name>/doc.kml
@@ -29,7 +31,7 @@
 set -euo pipefail
 
 usage() {
-  sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-1}"
 }
 
@@ -44,6 +46,7 @@ BACKGROUND=0
 LIST_RUNNING=0
 INSTALL_SERVICE=""
 UNINSTALL_SERVICE=""
+KILL_ALL=0
 
 ORIG_ARGS=("$@")
 
@@ -59,6 +62,7 @@ while [[ $# -gt 0 ]]; do
     --list-running)       LIST_RUNNING=1; shift ;;
     --install-service)    INSTALL_SERVICE="$2"; shift 2 ;;
     --uninstall-service)  UNINSTALL_SERVICE="$2"; shift 2 ;;
+    --kill-all)           KILL_ALL=1; shift ;;
     -h|--help)            usage 0 ;;
     -*)                   echo "Unknown flag: $1" >&2; usage ;;
     *)
@@ -144,6 +148,56 @@ if [[ -n "${INSTALL_SERVICE}" ]]; then
   echo "  Follow logs:  journalctl --user -u ${UNIT} -f"
   echo "  Status     :  systemctl --user status ${UNIT}"
   echo "  Stop       :  ${BASH_SOURCE[0]} --uninstall-service ${INSTALL_SERVICE}"
+  exit 0
+fi
+
+# ─── --kill-all: stop everything lidar-related and exit ─────────────────────
+if [[ ${KILL_ALL} -eq 1 ]]; then
+  EFFECTIVE_GIS_DIR="${GIS_DIR_OVERRIDE:-${GIS_DIR:-}}"
+  killed=0
+
+  # 1) Background sidecars under $GIS_DIR/lidar/logs/*.log.pid
+  if [[ -n "${EFFECTIVE_GIS_DIR}" && -d "${EFFECTIVE_GIS_DIR}/lidar/logs" ]]; then
+    shopt -s nullglob
+    for pidfile in "${EFFECTIVE_GIS_DIR}/lidar/logs"/*.log.pid; do
+      pid=$(cat "${pidfile}" 2>/dev/null || true)
+      if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+        echo "  TERM background PID ${pid} (${pidfile%.pid})"
+        kill -TERM "${pid}" 2>/dev/null || true
+        killed=$((killed + 1))
+      fi
+      rm -f "${pidfile}"
+    done
+    shopt -u nullglob
+  fi
+
+  # 2) systemd --user services: lidar-hillshade@*.service
+  if command -v systemctl >/dev/null; then
+    while IFS= read -r unit; do
+      [[ -z "${unit}" ]] && continue
+      echo "  STOP systemd unit ${unit}"
+      systemctl --user stop "${unit}" 2>/dev/null || true
+      killed=$((killed + 1))
+    done < <(systemctl --user list-units --type=service --no-legend --plain \
+             'lidar-hillshade@*.service' 2>/dev/null | awk '{print $1}')
+  fi
+
+  # 3) Stray lidar_hillshade.sh processes not caught above (e.g. manual nohup).
+  #    Exclude self ($$) and our own parent shell.
+  while IFS= read -r p; do
+    [[ -z "${p}" || "${p}" == "$$" || "${p}" == "${PPID}" ]] && continue
+    if kill -0 "${p}" 2>/dev/null; then
+      echo "  TERM stray PID ${p}"
+      kill -TERM "${p}" 2>/dev/null || true
+      killed=$((killed + 1))
+    fi
+  done < <(pgrep -f 'lidar_hillshade\.sh' 2>/dev/null || true)
+
+  if [[ ${killed} -eq 0 ]]; then
+    echo "Nothing to kill."
+  else
+    echo "Sent TERM to ${killed} target(s)."
+  fi
   exit 0
 fi
 
