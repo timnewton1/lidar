@@ -277,7 +277,6 @@ for SHADING in "${SHADINGS[@]}"; do
     reproject_to_wgs84 "${SHADE_TIF}" "${WGS84_TIF}"
 
     echo "  Building tile pyramid..."
-    local MAX_ZOOM
     MAX_ZOOM=$(compute_max_zoom "${WGS84_TIF}")
     echo "  Max zoom: ${MAX_ZOOM} (native resolution)"
     # --min-zoom 5: overview tiles down to ~300km/tile, visible at any altitude.
