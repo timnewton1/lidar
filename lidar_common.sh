@@ -31,16 +31,27 @@ DEM_DIR="${LIDAR_DIR}/tiles/dem"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 # ─── GDAL via QGIS flatpak ───────────────────────────────────────────────────
+# Migrated from gdal2tiles.py to `gdal raster tile` (GDAL 3.11+). gdal2tiles.py
+# is deprecated in GDAL 3.13 and removed in 3.15.
 GDAL_FLATPAK_APP="org.qgis.qgis"
+GDAL=(flatpak          run --command=gdal           "${GDAL_FLATPAK_APP}")
 GDALDEM=(flatpak       run --command=gdaldem        "${GDAL_FLATPAK_APP}")
 GDALWARP=(flatpak      run --command=gdalwarp       "${GDAL_FLATPAK_APP}")
 GDALBUILDVRT=(flatpak  run --command=gdalbuildvrt   "${GDAL_FLATPAK_APP}")
-GDAL2TILES=(flatpak    run --command=gdal2tiles.py  "${GDAL_FLATPAK_APP}")
 
 # ─── Hillshade parameters ────────────────────────────────────────────────────
+# Horn is preferred over ZevenbergenThorne for noisy DEMs (real lidar): ZT
+# is mathematically sharper on smooth surfaces but amplifies micro-noise.
+HS_ALGORITHM=Horn          # Horn | ZevenbergenThorne — override via --algorithm
+HS_MULTIDIRECTIONAL=0      # 1 = use -multidirectional (USGS's choice), ignores az/alt
 HS_AZIMUTH=315
 HS_ALTITUDE=45
 HS_Z_FACTOR=1.5
+
+# ─── USGS 3DEP NoData value ──────────────────────────────────────────────────
+# Pin explicitly so adjacent projects with different NoData defaults don't
+# create bright/dark seam artifacts at mosaic boundaries.
+DEM_NODATA=-9999
 
 # ─── Known shadings ──────────────────────────────────────────────────────────
 KNOWN_SHADINGS=(hillshade slopeshade)
@@ -190,11 +201,17 @@ download_tiles() {
     printf "  [%d/%d] %s — downloading [%s / %s]\n" \
       "${PROCESSED}" "${TOTAL_TILES}" "${BASENAME}" \
       "$(human_bytes "${BYTES_DOWNLOADED}")" "$(human_bytes "${BYTES_TOTAL}")"
-    if ! curl -f -L --retry 3 --retry-delay 5 -o "${TILE_TIF}" "${URL}"; then
+    # Atomic write: stream into .partial, rename on success. -C - resumes a
+    # truncated .partial from prior run instead of restarting from byte 0.
+    local PARTIAL="${TILE_TIF}.partial"
+    if ! curl -fL --retry 5 --retry-all-errors --retry-delay 5 \
+              --fail-with-body --max-time 1800 -C - \
+              -o "${PARTIAL}" "${URL}"; then
       echo "  ERROR: download failed for ${URL}" >&2
       ERRORS=$((ERRORS + 1))
       continue
     fi
+    mv -f "${PARTIAL}" "${TILE_TIF}"
     local TILE_SIZE
     TILE_SIZE=$(stat -c %s "${TILE_TIF}")
     BYTES_DOWNLOADED=$((BYTES_DOWNLOADED + TILE_SIZE))
@@ -213,10 +230,17 @@ download_tiles() {
 
 derive_hillshade() {
   local in="$1" out="$2"
-  "${GDALDEM[@]}" hillshade "${in}" "${out}" \
-    -az "${HS_AZIMUTH}" -alt "${HS_ALTITUDE}" -z "${HS_Z_FACTOR}" \
-    -alg ZevenbergenThorne -combined -compute_edges \
-    -co COMPRESS=DEFLATE -co TILED=YES
+  local args=(hillshade "${in}" "${out}"
+    -z "${HS_Z_FACTOR}"
+    -alg "${HS_ALGORITHM}"
+    -compute_edges
+    -co COMPRESS=DEFLATE -co TILED=YES)
+  if [[ ${HS_MULTIDIRECTIONAL} -eq 1 ]]; then
+    args+=(-multidirectional)
+  else
+    args+=(-az "${HS_AZIMUTH}" -alt "${HS_ALTITUDE}" -combined)
+  fi
+  "${GDALDEM[@]}" "${args[@]}"
 }
 
 # Slopeshade: slope in degrees → grayscale via color-relief

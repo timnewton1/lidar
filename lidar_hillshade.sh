@@ -2,12 +2,17 @@
 # Usage: lidar_hillshade.sh [options] <downloadlist.txt>
 #
 # Options:
-#   --shading LIST   comma-separated shadings to render. Default: hillshade
-#                    Known: hillshade, slopeshade
-#   --name NAME      output directory + root KML <name>. Default: superoverlay_TIMESTAMP
-#   --gis-dir PATH   override GIS_DIR for this run
-#   --kmz            also package the pyramid into a portable .kmz file
-#   -h, --help       show this help
+#   --shading LIST       comma-separated shadings to render. Default: hillshade
+#                        Known: hillshade, slopeshade
+#   --algorithm ALG      hillshade algorithm: Horn (default) | ZevenbergenThorne
+#                        Horn is the safer default for noisy lidar DEMs.
+#   --multidirectional   use gdaldem -multidirectional (USGS's choice);
+#                        otherwise -combined with az=315 alt=45.
+#   --name NAME          output directory + root KML <name>.
+#                        Default: superoverlay_TIMESTAMP
+#   --gis-dir PATH       override GIS_DIR for this run
+#   --kmz                also package the pyramid into a portable .kmz file
+#   -h, --help           show this help
 #
 # Output: $GIS_DIR/lidar/kml/<name>/doc.kml
 #   Layout: kml/<name>/<shading>/<project>/doc.kml
@@ -17,7 +22,7 @@
 set -euo pipefail
 
 usage() {
-  sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-1}"
 }
 
@@ -26,15 +31,19 @@ NAME=""
 PACKAGE_KMZ=0
 GIS_DIR_OVERRIDE=""
 DOWNLOAD_LIST=""
+ALGORITHM=""
+MULTIDIRECTIONAL=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --shading)  SHADINGS_CSV="$2"; shift 2 ;;
-    --name)     NAME="$2"; shift 2 ;;
-    --gis-dir)  GIS_DIR_OVERRIDE="$2"; shift 2 ;;
-    --kmz)      PACKAGE_KMZ=1; shift ;;
-    -h|--help)  usage 0 ;;
-    -*)         echo "Unknown flag: $1" >&2; usage ;;
+    --shading)          SHADINGS_CSV="$2"; shift 2 ;;
+    --algorithm)        ALGORITHM="$2"; shift 2 ;;
+    --multidirectional) MULTIDIRECTIONAL=1; shift ;;
+    --name)             NAME="$2"; shift 2 ;;
+    --gis-dir)          GIS_DIR_OVERRIDE="$2"; shift 2 ;;
+    --kmz)              PACKAGE_KMZ=1; shift ;;
+    -h|--help)          usage 0 ;;
+    -*)                 echo "Unknown flag: $1" >&2; usage ;;
     *)
       [[ -n "${DOWNLOAD_LIST}" ]] && { echo "Too many arguments" >&2; usage; }
       DOWNLOAD_LIST="$1"; shift ;;
@@ -57,6 +66,15 @@ for s in "${SHADINGS[@]}"; do
     exit 1
   }
 done
+
+# ─── Apply hillshade tuning flags (override lidar_common.sh defaults) ────────
+if [[ -n "${ALGORITHM}" ]]; then
+  case "${ALGORITHM}" in
+    Horn|ZevenbergenThorne) HS_ALGORITHM="${ALGORITHM}" ;;
+    *) echo "ERROR: --algorithm must be Horn or ZevenbergenThorne" >&2; exit 1 ;;
+  esac
+fi
+[[ ${MULTIDIRECTIONAL} -eq 1 ]] && HS_MULTIDIRECTIONAL=1
 
 [[ -z "${NAME}" ]] && NAME="superoverlay_${TIMESTAMP}"
 
@@ -128,13 +146,16 @@ echo "STEP 6: Generating tile pyramids (${#SHADINGS[@]} shading(s) × ${#PROJECT
 echo "=========================================="
 
 mkdir -p "${OUT_DIR}"
-PROCESSES=$(nproc 2>/dev/null || echo 4)
 
 # Per-project DEM VRT is built once and reused across shadings.
+# Pin nodata explicitly: adjacent USGS projects sometimes ship different
+# NoData defaults, which causes bright/dark seam artifacts at boundaries.
 declare -A DEM_VRT=()
 for PROJECT in "${PROJECT_NAMES[@]}"; do
   VRT="${WORK_DIR}/${PROJECT}_dem.vrt"
-  "${GDALBUILDVRT[@]}" -input_file_list "${LISTS_DIR}/${PROJECT}.list" "${VRT}"
+  "${GDALBUILDVRT[@]}" \
+    -srcnodata "${DEM_NODATA}" -vrtnodata "${DEM_NODATA}" \
+    -input_file_list "${LISTS_DIR}/${PROJECT}.list" "${VRT}"
   DEM_VRT["${PROJECT}"]="${VRT}"
 done
 
@@ -159,12 +180,16 @@ for SHADING in "${SHADINGS[@]}"; do
     reproject_to_wgs84 "${SHADE_TIF}" "${WGS84_TIF}"
 
     echo "  Building tile pyramid..."
-    # -t sets the project sub-doc.kml <name> for GE sidebar
-    "${GDAL2TILES[@]}" \
-      -p geodetic -k -r average \
-      --tiledriver=JPEG --jpeg-quality=88 \
-      -t "${PROJECT}" \
-      --processes="${PROCESSES}" \
+    # `gdal raster tile` (GDAL 3.11+) — C++ port of gdal2tiles, 3-6× faster.
+    # --title sets the project sub-doc.kml <name> shown in the GE sidebar.
+    "${GDAL[@]}" raster tile \
+      --tiling-scheme WorldCRS84Quad \
+      --kml \
+      --webviewer none \
+      -r average \
+      -f JPEG --co JPEG_QUALITY=88 \
+      --title "${PROJECT}" \
+      -j ALL_CPUS \
       "${WGS84_TIF}" "${PROJ_OUT}"
 
     rm -f "${SHADE_TIF}" "${WGS84_TIF}"
