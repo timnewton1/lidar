@@ -321,6 +321,7 @@ for SHADING in "${SHADINGS[@]}"; do
         inject_lookat "${PROJ_OUT}/doc.kml" "${LK_LON}" "${LK_LAT}" "${LK_RANGE}"
         echo "  LookAt: ${LK_LON}, ${LK_LAT} @ ${LK_RANGE}m"
       fi
+      ensure_root_networklink "${PROJ_OUT}/doc.kml" "${PROJ_OUT}"
     fi
 
     rm -f "${SHADE_TIF}" "${WGS84_TIF}"

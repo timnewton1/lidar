@@ -138,6 +138,57 @@ inject_lookat() {
   sed -i "0,/<Document>/{s|<Document>|<Document>${lookat}|}" "${kml}"
 }
 
+# ensure_root_networklink: gdal raster tile emits a root doc.kml with no
+# <NetworkLink> when --skip-blank suppresses every min-zoom tile (happens
+# when the data extent is much smaller than a z=0 WorldCRS84Quad tile —
+# the data resamples to fully-transparent pixels and the tile is dropped,
+# so the KML emitter has nothing to link to). Google Earth then opens an
+# empty Document. Fix: link the root to the lowest-zoom tile KML that
+# actually exists on disk. Idempotent — no-op if a NetworkLink is already
+# present.
+# Args: <doc_kml_path> <tile_dir>
+ensure_root_networklink() {
+  local kml="$1" dir="$2"
+  grep -q '<NetworkLink' "${kml}" && return 0
+  # Tile-KML layout is <dir>/<z>/<x>/<y>.kml. sort -V orders numerically
+  # across z, x, y so head picks the lowest zoom (and within it, the
+  # lowest x/y) — a child tile whose own <Region> is well-formed.
+  local child
+  child=$(find "${dir}" -mindepth 3 -maxdepth 3 \
+            -regextype posix-extended -regex '.*/[0-9]+/[0-9]+/[0-9]+\.kml' \
+          | sort -V | head -n1) || true
+  [[ -z "${child}" ]] && { echo "  WARN: no child KML under ${dir}; doc.kml left without NetworkLink" >&2; return 0; }
+  local rel="${child#${dir}/}"
+  # Copy the child's first <LatLonAltBox> (its own Region) so the root
+  # Region matches the tile it links to. The child also contains nested
+  # <LatLonAltBox> elements for its own NetworkLinks — stop at the first.
+  local box
+  box=$(awk '/<LatLonAltBox>/{flag=1} flag{print} /<\/LatLonAltBox>/{exit}' "${child}")
+  [[ -z "${box}" ]] && { echo "  WARN: no <LatLonAltBox> in ${child}; doc.kml left without NetworkLink" >&2; return 0; }
+  local nl="    <NetworkLink>
+      <name>${rel}</name>
+      <Region>
+${box}
+        <Lod>
+          <minLodPixels>128</minLodPixels>
+          <maxLodPixels>-1</maxLodPixels>
+        </Lod>
+      </Region>
+      <Link>
+        <href>${rel}</href>
+        <viewRefreshMode>onRegion</viewRefreshMode>
+      </Link>
+    </NetworkLink>"
+  # Insert before </Document>. Use python for a multi-line, regex-safe
+  # replace — sed multi-line escaping in shell is fragile.
+  python3 -c '
+import sys
+p, nl = sys.argv[1], sys.argv[2]
+with open(p) as f: t = f.read()
+with open(p, "w") as f: f.write(t.replace("</Document>", nl + "\n</Document>", 1))
+' "${kml}" "${nl}"
+}
+
 # ─── Reproject helper ────────────────────────────────────────────────────────
 # -srcnodata 0: gdaldem writes 0 for nodata pixels (single-band byte).
 # -dstalpha: bilinear can blend nodata=0 into real pixels near edges, leaving
