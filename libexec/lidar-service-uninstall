@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# `lidar service uninstall N` — stop, disable, and remove service N.
+
+source "${LIDAR_HOME}/lib/strict.sh"
+
+NAME="${1:-}"
+[[ -n "${NAME}" ]] || { echo "Usage: lidar service uninstall <name>" >&2; exit 2; }
+
+UNIT="lidar@${NAME}.service"
+ENV_FILE="${HOME}/.config/lidar/${NAME}.env"
+DROPIN_DIR="${HOME}/.config/systemd/user/lidar@${NAME}.service.d"
+
+echo "Uninstalling ${UNIT}..."
+systemctl --user stop    "${UNIT}" 2>/dev/null || true
+systemctl --user disable "${UNIT}" 2>/dev/null || true
+rm -f "${ENV_FILE}"
+rm -rf "${DROPIN_DIR}"
+systemctl --user daemon-reload
+echo "  Stopped + disabled."
+echo "  Removed env file : ${ENV_FILE}"
+echo "  Removed drop-in  : ${DROPIN_DIR}"
+echo "  (Unit template + linger state left intact.)"

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+cat <<'EOF'
+Usage: lidar <subcommand> [options...]
+
+Subcommands:
+  run                    Download tiles, mosaic, derive shading, build tile pyramid
+  list                   List runs from the events index
+  kill                   Stop a running pipeline (by PID, or --all)
+  service install N      Install systemd --user service named N
+  service uninstall N    Stop, disable, and remove service N
+  help                   Show this help
+
+Run `lidar <subcommand> --help` for per-subcommand details.
+EOF
