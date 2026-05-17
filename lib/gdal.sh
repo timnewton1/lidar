@@ -6,6 +6,24 @@
 [[ -n "${_LIDAR_GDAL_LOADED:-}" ]] && return 0
 _LIDAR_GDAL_LOADED=1
 
+# ─── WorldCRS84Quad geometry (OGC TileMatrixSet 2D spec) ─────────────────────
+# At zoom 0 the world is tiled 2×1; each tile spans 180° square. At zoom z
+# there are 2^(z+1) × 2^z tiles, each 180/2^z degrees on a side. Tiles are
+# 256-pixel squares, so one tile pixel covers 180 / (256 * 2^z) degrees.
+WCQ_TILE_DEG_Z0=180   # tile span in degrees at zoom 0
+WCQ_TILE_PX=256       # tile dimension in pixels
+
+# ─── Zoom-range tuning ───────────────────────────────────────────────────────
+# How many tiles span the data extent at min zoom — a few tiles gives a
+# tight doc.kml bounding box while still being visible at regional zoom.
+ZOOM_MIN_TILES_PER_SIDE=3
+# Always keep at least this many overview levels below max zoom, even when
+# the data is small enough that the extent-derived min would crowd it.
+ZOOM_MIN_OVERVIEW_LEVELS=3
+# Hard ceiling on max zoom — guards against pathological inputs (sub-cm
+# pixels) creating thousands of tiles. WorldCRS84Quad z=22 ≈ 2.6 cm/pixel.
+ZOOM_MAX_CAP=22
+
 # ─── Derivation: shading algorithms ──────────────────────────────────────────
 # Each takes a DEM raster (native or WGS84) and writes a single-band byte
 # GeoTIFF ready to tile. Compute in the source projection — gdaldem handles
@@ -53,21 +71,56 @@ derive_shading() {
   esac
 }
 
-# Compute the WorldCRS84Quad max zoom that matches a raster's native resolution.
-# Reads pixel size from gdalinfo, applies round(log2(360/(256*px))), caps at 22.
+# Read Size + Pixel Size from gdalinfo. Sets SIZE_X SIZE_Y PIXEL_SIZE in caller.
+# Returns 1 if any field is missing.
+_read_raster_dims() {
+  local tif="$1" info
+  info=$("${GDALINFO[@]}" "${tif}" 2>/dev/null) || return 1
+  # `|| true` keeps pipefail-under-set-e from killing us if grep misses; the
+  # explicit empty-string checks below handle the failure path.
+  SIZE_X=$(echo "${info}" | { grep -oP '^Size is \K[0-9]+'           || true; })
+  SIZE_Y=$(echo "${info}" | { grep -oP '^Size is [0-9]+, \K[0-9]+'   || true; })
+  PIXEL_SIZE=$(echo "${info}" | { grep -oP 'Pixel Size = \(\K[0-9.eE+-]+' || true; })
+  [[ -n "${SIZE_X}" && -n "${SIZE_Y}" && -n "${PIXEL_SIZE}" ]]
+}
+
+# compute_max_zoom: lowest zoom where a tile pixel is no larger than a source
+# pixel — i.e. the source's native resolution with no information loss.
+# Solving (180 / (256 * 2^z)) ≤ px  →  z ≥ log2(180 / (256*px)). Uses ceil so
+# we land at-or-above native, never below. Clamped by ZOOM_MAX_CAP.
 # Usage: max_zoom=$(compute_max_zoom path/to/wgs84.tif)
 compute_max_zoom() {
-  local tif="$1"
-  local pixel_size
-  # `|| true` keeps pipefail from killing us under set -e if grep finds nothing;
-  # the empty-string check below handles the failure cleanly.
-  pixel_size=$("${GDALINFO[@]}" "${tif}" 2>/dev/null \
-    | { grep -oP 'Pixel Size = \(\K[0-9.eE+-]+' || true; })
-  [[ -z "${pixel_size}" ]] && { echo "ERROR: could not read pixel size from ${tif}" >&2; return 1; }
-  awk -v px="${pixel_size}" 'BEGIN {
-    z = log(360 / (256 * px)) / log(2)
-    z = int(z + 0.5)  # round to nearest: preserves native res without upsampling
-    print (z > 22) ? 22 : (z < 1) ? 1 : z
+  local tif="$1" SIZE_X SIZE_Y PIXEL_SIZE
+  _read_raster_dims "${tif}" || { echo "ERROR: could not read raster dims from ${tif}" >&2; return 1; }
+  awk -v px="${PIXEL_SIZE}" -v wdeg="${WCQ_TILE_DEG_Z0}" -v tpx="${WCQ_TILE_PX}" -v cap="${ZOOM_MAX_CAP}" 'BEGIN {
+    raw = log(wdeg / (tpx * px)) / log(2)
+    z = int(raw); if (raw > z) z++   # ceil
+    if (z > cap) z = cap
+    if (z < 1)   z = 1
+    print z
+  }'
+}
+
+# compute_min_zoom: lowest zoom where ~ZOOM_MIN_TILES_PER_SIDE tiles span the
+# data extent. Matters because the doc.kml bounding box is the union of the
+# lowest-zoom tiles touching the data: too coarse a min zoom and a county-
+# sized dataset claims a several-hundred-km rectangle. Solving
+# (wdeg / 2^z) = ext / N  →  z = log2(N * wdeg / ext).
+# Then clamped to leave at least ZOOM_MIN_OVERVIEW_LEVELS below max_zoom.
+# Usage: min_zoom=$(compute_min_zoom path/to/wgs84.tif <max_zoom>)
+compute_min_zoom() {
+  local tif="$1" max_zoom="$2" SIZE_X SIZE_Y PIXEL_SIZE
+  [[ -n "${max_zoom}" ]] || { echo "ERROR: compute_min_zoom requires max_zoom arg" >&2; return 1; }
+  _read_raster_dims "${tif}" || { echo "ERROR: could not read raster dims from ${tif}" >&2; return 1; }
+  awk -v sx="${SIZE_X}" -v sy="${SIZE_Y}" -v px="${PIXEL_SIZE}" \
+      -v wdeg="${WCQ_TILE_DEG_Z0}" -v n="${ZOOM_MIN_TILES_PER_SIDE}" \
+      -v maxz="${max_zoom}" -v floor_gap="${ZOOM_MIN_OVERVIEW_LEVELS}" 'BEGIN {
+    ext = (sx > sy ? sx : sy) * px           # data extent in degrees
+    z = log(n * wdeg / ext) / log(2)
+    z = int(z + 0.5)                         # round to nearest
+    if (z < 1) z = 1
+    if (z > maxz - floor_gap) z = maxz - floor_gap
+    print z
   }'
 }
 
