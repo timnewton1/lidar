@@ -399,14 +399,10 @@ echo "=========================================="
 mkdir -p "${OUT_DIR}"
 
 # Per-project DEM VRT is built once and reused across shadings.
-# Pin nodata explicitly: adjacent USGS projects sometimes ship different
-# NoData defaults, which causes bright/dark seam artifacts at boundaries.
 declare -A DEM_VRT=()
 for PROJECT in "${PROJECT_NAMES[@]}"; do
   VRT="${WORK_DIR}/${PROJECT}_dem.vrt"
-  "${GDALBUILDVRT[@]}" \
-    -srcnodata "${DEM_NODATA}" -vrtnodata "${DEM_NODATA}" \
-    -input_file_list "${LISTS_DIR}/${PROJECT}.list" "${VRT}"
+  build_dem_vrt "${LISTS_DIR}/${PROJECT}.list" "${VRT}"
   DEM_VRT["${PROJECT}"]="${VRT}"
 done
 
@@ -452,57 +448,11 @@ echo "=========================================="
 echo "STEP 7: Writing KML index"
 echo "=========================================="
 
-# Per-shading intermediate doc.kml: NetworkLinks one entry per project
-for SHADING in "${SHADINGS[@]}"; do
-  SHADING_KML="${OUT_DIR}/${SHADING}/doc.kml"
-  {
-    cat <<HEAD
-<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2">
-<Document>
-  <name>${SHADING}</name>
-  <open>1</open>
-HEAD
-    for PROJECT in "${PROJECT_NAMES[@]}"; do
-      cat <<NL
-  <NetworkLink>
-    <name>${PROJECT}</name>
-    <visibility>1</visibility>
-    <Link><href>${PROJECT}/doc.kml</href></Link>
-  </NetworkLink>
-NL
-    done
-    cat <<'TAIL'
-</Document>
-</kml>
-TAIL
-  } > "${SHADING_KML}"
-done
-
-# Root doc.kml: NetworkLinks one entry per shading
 ROOT_KML="${OUT_DIR}/doc.kml"
-{
-  cat <<HEAD
-<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2">
-<Document>
-  <name>${NAME}</name>
-  <open>1</open>
-HEAD
-  for SHADING in "${SHADINGS[@]}"; do
-    cat <<NL
-  <NetworkLink>
-    <name>${SHADING}</name>
-    <visibility>1</visibility>
-    <Link><href>${SHADING}/doc.kml</href></Link>
-  </NetworkLink>
-NL
-  done
-  cat <<'TAIL'
-</Document>
-</kml>
-TAIL
-} > "${ROOT_KML}"
+for SHADING in "${SHADINGS[@]}"; do
+  write_shading_kml "${OUT_DIR}/${SHADING}/doc.kml" "${SHADING}" "${PROJECT_NAMES[@]}"
+done
+write_root_kml "${ROOT_KML}" "${NAME}" "${SHADINGS[@]}"
 
 # ─── Step 8: Optional KMZ packaging ──────────────────────────────────────────
 KMZ_OUT=""
@@ -511,9 +461,8 @@ if [[ ${PACKAGE_KMZ} -eq 1 ]]; then
   echo "STEP 8: Packaging KMZ"
   echo "=========================================="
   KMZ_DIR="${LIDAR_DIR}/kmz"
-  mkdir -p "${KMZ_DIR}"
   KMZ_OUT="${KMZ_DIR}/${NAME}.kmz"
-  ( cd "${OUT_DIR}" && zip -rq "${KMZ_OUT}" . -x '*.aux.xml' )
+  package_kmz "${KMZ_OUT}" "${OUT_DIR}" "${KMZ_DIR}"
   echo "  KMZ: ${KMZ_OUT} ($(human_bytes "$(stat -c %s "${KMZ_OUT}")"))"
 fi
 
