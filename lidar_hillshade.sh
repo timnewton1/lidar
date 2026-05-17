@@ -95,49 +95,55 @@ extra_deps=()
 [[ ${PACKAGE_KMZ} -eq 1 ]] && extra_deps+=(zip)
 
 check_deps_and_input "${DOWNLOAD_LIST}" "${extra_deps[@]+"${extra_deps[@]}"}"
+LISTS_DIR="${WORK_DIR}/project_lists"
 prescan
 make_dirs "${KML_DIR}"
 download_tiles
 
-# ─── Step 5: Group downloaded DEM tiles by USGS project ──────────────────────
+# ─── Step 5: Materialize per-project tile-file lists ─────────────────────────
+# prescan already grouped URLs into ${LISTS_DIR}/<project>.urls. Here we
+# resolve each URL to its on-disk path, dropping any tile whose download
+# failed, and emit ${LISTS_DIR}/<project>.list for gdalbuildvrt.
 echo "=========================================="
-echo "STEP 5: Grouping tiles by project"
+echo "STEP 5: Resolving downloaded tiles by project"
 echo "=========================================="
 
-LISTS_DIR="${WORK_DIR}/project_lists"
-mkdir -p "${LISTS_DIR}"
-
-declare -A PROJECT_COUNT=()
 MISSING=0
-SKIPPED_NO_PROJECT=0
-while IFS= read -r URL; do
-  [[ -z "${URL}" ]] && continue
-  BASENAME="${URL##*/}"; BASENAME="${BASENAME%.tif}"
-  TILE_TIF="${DEM_DIR}/${BASENAME}.tif"
-  if [[ ! -f "${TILE_TIF}" ]]; then
-    MISSING=$((MISSING + 1))
-    continue
-  fi
-  PROJECT=$(project_from_url "${URL}")
-  if [[ -z "${PROJECT}" ]]; then
-    SKIPPED_NO_PROJECT=$((SKIPPED_NO_PROJECT + 1))
-    echo "  WARNING: no Projects/<name>/ segment in URL — skipping: ${URL}"
-    continue
-  fi
-  echo "${TILE_TIF}" >> "${LISTS_DIR}/${PROJECT}.list"
-  PROJECT_COUNT["${PROJECT}"]=$((${PROJECT_COUNT["${PROJECT}"]:-0} + 1))
-done < "${FILTERED_LIST}"
+declare -A PROJECT_READY=()
+for PROJECT in "${PROJECT_NAMES[@]}"; do
+  URLS_FILE="${LISTS_DIR}/${PROJECT}.urls"
+  LIST_FILE="${LISTS_DIR}/${PROJECT}.list"
+  : > "${LIST_FILE}"
+  N=0
+  while IFS= read -r URL; do
+    [[ -z "${URL}" ]] && continue
+    BASENAME="${URL##*/}"; BASENAME="${BASENAME%.tif}"
+    TILE_TIF="${DEM_DIR}/${BASENAME}.tif"
+    if [[ -f "${TILE_TIF}" ]]; then
+      echo "${TILE_TIF}" >> "${LIST_FILE}"
+      N=$((N + 1))
+    else
+      MISSING=$((MISSING + 1))
+    fi
+  done < "${URLS_FILE}"
+  PROJECT_READY["${PROJECT}"]="${N}"
+done
 
-mapfile -t PROJECT_NAMES < <(printf '%s\n' "${!PROJECT_COUNT[@]}" | sort)
+# Filter out projects with zero successful tiles.
+READY_PROJECTS=()
+for PROJECT in "${PROJECT_NAMES[@]}"; do
+  [[ "${PROJECT_READY[${PROJECT}]}" -gt 0 ]] && READY_PROJECTS+=("${PROJECT}")
+done
+PROJECT_NAMES=("${READY_PROJECTS[@]}")
 
 if [[ ${#PROJECT_NAMES[@]} -eq 0 ]]; then
-  echo "ERROR: no DEM tiles available to mosaic (${MISSING} missing, ${SKIPPED_NO_PROJECT} skipped)"
+  echo "ERROR: no DEM tiles available to mosaic (${MISSING} missing)"
   exit 1
 fi
 
-echo "  Projects found: ${#PROJECT_NAMES[@]}  (${MISSING} missing, ${SKIPPED_NO_PROJECT} skipped)"
+echo "  Projects ready: ${#PROJECT_NAMES[@]}  (${MISSING} missing tiles)"
 for PROJECT in "${PROJECT_NAMES[@]}"; do
-  printf "    %-60s %5d tiles\n" "${PROJECT}" "${PROJECT_COUNT[${PROJECT}]}"
+  printf "    %-60s %5d tiles\n" "${PROJECT}" "${PROJECT_READY[${PROJECT}]}"
 done
 
 # ─── Step 6: Per-shading × per-project pyramids ──────────────────────────────
