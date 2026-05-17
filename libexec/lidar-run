@@ -282,6 +282,9 @@ for SHADING in "${SHADINGS[@]}"; do
     # --min-zoom 5: overview tiles down to ~300km/tile, visible at any altitude.
     # --max-zoom: computed from actual WGS84 pixel size so it's always native
     # resolution regardless of source dataset or latitude.
+    # Default PNG output preserves the alpha band from reproject_to_wgs84.
+    # --skip-blank drops fully-transparent tiles (huge wins for scattered
+    # projects where the bounding box is mostly nodata).
     "${GDAL[@]}" raster tile \
       --tiling-scheme WorldCRS84Quad \
       --kml \
@@ -290,7 +293,7 @@ for SHADING in "${SHADINGS[@]}"; do
       --max-zoom "${MAX_ZOOM}" \
       -r average \
       --overview-resampling average \
-      -f JPEG --co JPEG_QUALITY=88 \
+      --skip-blank \
       --title "${PROJECT}" \
       -j ALL_CPUS \
       "${WGS84_TIF}" "${PROJ_OUT}"
