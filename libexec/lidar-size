@@ -63,7 +63,7 @@ if [[ -d "${KML_DIR}" ]]; then
       -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
     dem_bytes=$(( dem_bytes + project_bytes ))
     dem_projects+=("${project}")
-  done < <(find "${KML_DIR}" -mindepth 3 -maxdepth 3 -type d | sort -u)
+  done < <(find "${KML_DIR}" -mindepth 2 -maxdepth 2 -type d | sort -u)
 fi
 
 if [[ ${dem_bytes} -gt 0 ]]; then
