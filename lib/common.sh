@@ -30,6 +30,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 GDAL_FLATPAK_APP="org.qgis.qgis"
 GDAL=(flatpak          run --command=gdal           "${GDAL_FLATPAK_APP}")
 GDALDEM=(flatpak       run --command=gdaldem        "${GDAL_FLATPAK_APP}")
+GDALINFO=(flatpak      run --command=gdalinfo       "${GDAL_FLATPAK_APP}")
 GDALWARP=(flatpak      run --command=gdalwarp       "${GDAL_FLATPAK_APP}")
 GDALBUILDVRT=(flatpak  run --command=gdalbuildvrt   "${GDAL_FLATPAK_APP}")
 

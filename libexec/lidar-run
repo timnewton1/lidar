@@ -274,12 +274,20 @@ for SHADING in "${SHADINGS[@]}"; do
     reproject_to_wgs84 "${SHADE_TIF}" "${WGS84_TIF}"
 
     echo "  Building tile pyramid..."
-    # `gdal raster tile` (GDAL 3.11+) — C++ port of gdal2tiles, 3-6× faster.
+    local MAX_ZOOM
+    MAX_ZOOM=$(compute_max_zoom "${WGS84_TIF}")
+    echo "  Max zoom: ${MAX_ZOOM} (native resolution)"
+    # --min-zoom 5: overview tiles down to ~300km/tile, visible at any altitude.
+    # --max-zoom: computed from actual WGS84 pixel size so it's always native
+    # resolution regardless of source dataset or latitude.
     "${GDAL[@]}" raster tile \
       --tiling-scheme WorldCRS84Quad \
       --kml \
       --webviewer none \
+      --min-zoom 5 \
+      --max-zoom "${MAX_ZOOM}" \
       -r average \
+      --overview-resampling average \
       -f JPEG --co JPEG_QUALITY=88 \
       --title "${PROJECT}" \
       -j ALL_CPUS \
