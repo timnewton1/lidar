@@ -63,9 +63,9 @@ TAIL
 }
 
 # Package an output directory into a .kmz file.
-# Args: <kmz_out_path> <out_dir> <kmz_parent_dir>
+# out_kmz must be an absolute path; caller is responsible for mkdir -p.
+# Args: <out_dir> <out_kmz>
 package_kmz() {
-  local kmz_out="$1" out_dir="$2" kmz_dir="$3"
-  mkdir -p "${kmz_dir}"
-  ( cd "${out_dir}" && zip -rq "${kmz_out}" . -x '*.aux.xml' )
+  local out_dir="$1" out_kmz="$2"
+  ( cd "${out_dir}" && zip -rq "${out_kmz}" . -x '*.aux.xml' )
 }
