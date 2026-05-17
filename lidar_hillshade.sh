@@ -62,19 +62,6 @@ LR_JSON=0
 
 ORIG_ARGS=("$@")
 
-# Parse human duration suffixes: 30m, 24h, 7d → seconds.
-parse_duration() {
-  local s="$1" n="${1%[smhd]}" u="${1: -1}"
-  [[ "${s}" =~ ^[0-9]+[smhd]?$ ]] || { echo "bad duration: ${s}" >&2; exit 1; }
-  case "${u}" in
-    s) echo $((n)) ;;
-    m) echo $((n * 60)) ;;
-    h) echo $((n * 3600)) ;;
-    d) echo $((n * 86400)) ;;
-    *) echo $((s)) ;;
-  esac
-}
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --shading)            SHADINGS_CSV="$2"; shift 2 ;;

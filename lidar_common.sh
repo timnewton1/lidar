@@ -1,87 +1,15 @@
 #!/usr/bin/env bash
 # Shared library for the lidar shading pipeline.
 # Source this file; do not execute it directly.
-#
-# Pipeline: download DEMs → per-project VRT of native DEMs → derive shading
-# (hillshade/slopeshade) on the mosaic → reproject to WGS84 → gdal2tiles
-# super-overlay. Per-project mosaics eliminate seam artifacts that arise from
-# per-tile sun-angle calculations.
-#
-# Required (must be set before sourcing OR via --gis-dir in the caller):
-#   GIS_DIR  — root GIS data directory (e.g. /mnt/data/gis)
 
-[[ -n "${_LIDAR_COMMON_LOADED:-}" ]] && return 0
-_LIDAR_COMMON_LOADED=1
+[[ -n "${_LIDAR_COMMON_SHIM_LOADED:-}" ]] && return 0
+_LIDAR_COMMON_SHIM_LOADED=1
 
-if [[ -z "${GIS_DIR:-}" ]]; then
-  echo "ERROR: GIS_DIR is not set." >&2
-  echo "  Either: export GIS_DIR=/path/to/gis" >&2
-  echo "  Or pass: --gis-dir /path/to/gis" >&2
-  exit 1
-fi
-
-# ─── Directory layout ────────────────────────────────────────────────────────
-# Only DEM_DIR is persistent — the download cache. All derived rasters
-# (hillshade, slopeshade, reprojected) are per-run scratch under WORK_DIR
-# (created by the caller, cleaned via trap). Flatpak GDAL sandbox cannot
-# read /tmp, so WORK_DIR must live under LIDAR_DIR.
-LIDAR_DIR="${GIS_DIR}/lidar"
-DEM_DIR="${LIDAR_DIR}/tiles/dem"
-
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-
-# ─── GDAL via QGIS flatpak ───────────────────────────────────────────────────
-# Migrated from gdal2tiles.py to `gdal raster tile` (GDAL 3.11+). gdal2tiles.py
-# is deprecated in GDAL 3.13 and removed in 3.15.
-GDAL_FLATPAK_APP="org.qgis.qgis"
-GDAL=(flatpak          run --command=gdal           "${GDAL_FLATPAK_APP}")
-GDALDEM=(flatpak       run --command=gdaldem        "${GDAL_FLATPAK_APP}")
-GDALWARP=(flatpak      run --command=gdalwarp       "${GDAL_FLATPAK_APP}")
-GDALBUILDVRT=(flatpak  run --command=gdalbuildvrt   "${GDAL_FLATPAK_APP}")
-
-# ─── Hillshade parameters ────────────────────────────────────────────────────
-# Horn is preferred over ZevenbergenThorne for noisy DEMs (real lidar): ZT
-# is mathematically sharper on smooth surfaces but amplifies micro-noise.
-HS_ALGORITHM=Horn          # Horn | ZevenbergenThorne — override via --algorithm
-HS_MULTIDIRECTIONAL=0      # 1 = use -multidirectional (USGS's choice), ignores az/alt
-HS_AZIMUTH=315
-HS_ALTITUDE=45
-HS_Z_FACTOR=1.5
-
-# ─── USGS 3DEP NoData value ──────────────────────────────────────────────────
-# Pin explicitly so adjacent projects with different NoData defaults don't
-# create bright/dark seam artifacts at mosaic boundaries.
-DEM_NODATA=-9999
-
-# ─── Known shadings ──────────────────────────────────────────────────────────
-KNOWN_SHADINGS=(hillshade slopeshade)
-
-is_known_shading() {
-  local s="$1" k
-  for k in "${KNOWN_SHADINGS[@]}"; do [[ "${k}" == "${s}" ]] && return 0; done
-  return 1
-}
-
-# ─── Run-events index ────────────────────────────────────────────────────────
-# Single append-only JSONL file at $LIDAR_DIR/logs/runs.jsonl. Each line is
-# one event: {"id":...,"event":"start|end",...}. Status is derived from the
-# latest event per id, with PID liveness used to distinguish running vs
-# crashed. Append-only is crash-safe (<4KB writes are atomic with O_APPEND
-# on Linux), so two concurrent runs writing 'start' simultaneously won't
-# interleave.
-EVENTS_FILE="${LIDAR_DIR}/logs/runs.jsonl"
-
-# Minimal JSON string escape — handles the chars that actually show up in
-# run names, paths, and CLI args. Not a general-purpose JSON encoder.
-json_escape() {
-  local s="$1"
-  s="${s//\\/\\\\}"
-  s="${s//\"/\\\"}"
-  s="${s//$'\n'/\\n}"
-  s="${s//$'\t'/\\t}"
-  s="${s//$'\r'/\\r}"
-  printf '%s' "${s}"
-}
+SCRIPT_DIR_LC=$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=lib/strict.sh
+source "${SCRIPT_DIR_LC}/lib/strict.sh"
+# shellcheck source=lib/common.sh
+source "${SCRIPT_DIR_LC}/lib/common.sh"
 
 events_emit_start() {
   local id="$1" log="$2"; shift 2
@@ -245,27 +173,6 @@ list_runs() {
     printf "${color}%-9s${C_RESET}  %-19s  %9s  %-24s  %s\n" \
       "${sym}" "${started_h}" "${dur_h}" "${id}" "${log_base}"
   done
-}
-
-# ─── Helpers ─────────────────────────────────────────────────────────────────
-human_bytes() { numfmt --to=iec --suffix=B --format='%.1f' "$1"; }
-
-# Format a duration in seconds as Hh:MMm or MMm:SSs.
-human_duration() {
-  local s="$1"
-  (( s < 0 )) && s=0
-  if (( s >= 3600 )); then
-    printf '%dh%02dm' $((s / 3600)) $(((s % 3600) / 60))
-  else
-    printf '%dm%02ds' $((s / 60)) $((s % 60))
-  fi
-}
-
-# Extract USGS project name from URL: ".../Projects/<NAME>/..." → "<NAME>"
-project_from_url() {
-  local rest="${1#*/Projects/}"
-  [[ "${rest}" == "$1" ]] && { echo ""; return; }
-  echo "${rest%%/*}"
 }
 
 # ─── Step 1: check_deps_and_input <download_list> [extra_cmd...] ─────────────
