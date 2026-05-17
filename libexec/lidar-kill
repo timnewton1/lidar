@@ -59,6 +59,21 @@ running_pids() {
   done
 }
 
+# TERM the whole process group, not just the leader PID. The pipeline blocks
+# in `wait` on long-running GDAL children (bwrap/gdaldem/gdalwarp/curl): a
+# signal to the bash leader sits queued until wait returns, and wait won't
+# return until the child finishes. Signaling the pgrp reaches every member.
+kill_target() {
+  local pid="$1" label="$2" pgid
+  pgid=$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ' || true)
+  echo "  TERM ${label} (pid=${pid}${pgid:+, pgid=${pgid}})"
+  if [[ -n "${pgid}" ]]; then
+    kill -TERM -- "-${pgid}" 2>/dev/null || true
+  else
+    kill -TERM "${pid}" 2>/dev/null || true
+  fi
+}
+
 killed=0
 
 if [[ ${#PIDS[@]} -gt 0 ]]; then
@@ -69,8 +84,7 @@ if [[ ${#PIDS[@]} -gt 0 ]]; then
       echo "  REFUSE PID ${p} — not a tracked running lidar run" >&2
       exit 1
     fi
-    echo "  TERM PID ${p} (${TRACKED[${p}]})"
-    kill -TERM "${p}" || true
+    kill_target "${p}" "PID ${p} (${TRACKED[${p}]})"
     killed=$((killed + 1))
   done
   echo "Sent TERM to ${killed} target(s)."
@@ -79,8 +93,7 @@ fi
 
 # --all: events-tracked live PIDs
 while read -r p id; do
-  echo "  TERM PID ${p} (${id})"
-  kill -TERM "${p}" 2>/dev/null || true
+  kill_target "${p}" "PID ${p} (${id})"
   killed=$((killed + 1))
 done < <(running_pids)
 
@@ -101,8 +114,7 @@ while IFS= read -r p; do
   comm=$(cat "/proc/${p}/comm" 2>/dev/null || true)
   [[ "${comm}" == "pgrep" ]] && continue
   if kill -0 "${p}" 2>/dev/null; then
-    echo "  TERM stray PID ${p} (${comm})"
-    kill -TERM "${p}" 2>/dev/null || true
+    kill_target "${p}" "stray PID ${p} (${comm})"
     killed=$((killed + 1))
   fi
 done < <(pgrep -f 'libexec/lidar-run' 2>/dev/null || true)
