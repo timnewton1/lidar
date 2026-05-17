@@ -184,18 +184,18 @@ if [[ ${KILL_ALL} -eq 1 ]]; then
 
   # 3) Stray lidar_hillshade.sh processes not caught above (e.g. manual nohup).
   #    Exclude self ($$), parent shell, and pgrep itself (its own cmdline
-  #    contains our pattern and would otherwise show up as a "stray").
-  while IFS= read -r line; do
-    p="${line%% *}"
-    cmd="${line#* }"
+  #    contains our pattern). Use /proc/PID/comm — kernel-tracked basename —
+  #    so '/usr/bin/pgrep' is detected reliably.
+  while IFS= read -r p; do
     [[ -z "${p}" || "${p}" == "$$" || "${p}" == "${PPID}" ]] && continue
-    [[ "${cmd}" == pgrep* ]] && continue
+    comm=$(cat "/proc/${p}/comm" 2>/dev/null || true)
+    [[ "${comm}" == "pgrep" ]] && continue
     if kill -0 "${p}" 2>/dev/null; then
-      echo "  TERM stray PID ${p}"
+      echo "  TERM stray PID ${p} (${comm})"
       kill -TERM "${p}" 2>/dev/null || true
       killed=$((killed + 1))
     fi
-  done < <(pgrep -af 'lidar_hillshade\.sh' 2>/dev/null || true)
+  done < <(pgrep -f 'lidar_hillshade\.sh' 2>/dev/null || true)
 
   if [[ ${killed} -eq 0 ]]; then
     echo "Nothing to kill."
