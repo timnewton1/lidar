@@ -86,10 +86,12 @@ if [[ ${BACKGROUND} -eq 1 ]]; then
     fi
   else
     while true; do
-      LOG_NAME="superoverlay_$(date +%Y%m%d_%H%M%S)_$(printf '%02x%02x%02x' $((RANDOM&255)) $((RANDOM&255)) $((RANDOM&255)))"
+      LOG_NAME="superoverlay_$(printf '%02x%02x%02x' $((RANDOM&255)) $((RANDOM&255)) $((RANDOM&255)))"
       LOG_FILE="${LOG_DIR}/${LOG_NAME}.log"
       [[ ! -e "${LOG_FILE}" ]] && break
     done
+    # Pass the generated name to the child so run ID == log filename.
+    CHILD_ARGS+=(--name "${LOG_NAME}")
   fi
   echo "Starting in background..."
   echo "  Log : ${LOG_FILE}"
@@ -124,7 +126,7 @@ KML_DIR="${LIDAR_DIR}/kml"
 
 if [[ -z "${NAME}" ]]; then
   while true; do
-    NAME="superoverlay_$(date +%Y%m%d_%H%M%S)_$(printf '%02x%02x%02x' $((RANDOM&255)) $((RANDOM&255)) $((RANDOM&255)))"
+    NAME="superoverlay_$(printf '%02x%02x%02x' $((RANDOM&255)) $((RANDOM&255)) $((RANDOM&255)))"
     [[ ! -e "${KML_DIR}/${NAME}" ]] && break
   done
 fi
@@ -171,7 +173,8 @@ echo $$ > "${LOCK_FILE}"
 # ─── Events: emit 'start' now and 'end' on exit ──────────────────────────────
 EVENT_LOG_PATH=""
 if [[ ! -t 1 ]]; then
-  EVENT_LOG_PATH=$(readlink -f /proc/self/fd/1 2>/dev/null || true)
+  # Use $$ (parent shell PID) not /proc/self — $() subshell replaces fd/1 with a pipe.
+  EVENT_LOG_PATH=$(readlink -f "/proc/$$/fd/1" 2>/dev/null || true)
   [[ "${EVENT_LOG_PATH}" == /dev/* ]] && EVENT_LOG_PATH=""
 fi
 events_emit_start "${NAME}" "${EVENT_LOG_PATH}" "${ORIG_ARGS[@]}"

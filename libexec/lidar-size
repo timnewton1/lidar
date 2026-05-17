@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# `lidar size` — show disk usage for a run's output files.
+#
+# Breaks down: DEM source tiles (shared), KML pyramid, KMZ, and log.
+# DEM tiles are shared across runs and are labelled as such.
+#
+# Usage: lidar size [options] <name|hex>
+#
+# Options:
+#   --gis-dir PATH   override GIS_DIR
+#   -h, --help       show this help
+
+source "${LIDAR_HOME}/lib/strict.sh"
+
+usage() { sed -n '3,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+
+GIS_DIR_OVERRIDE=""
+TARGET=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --gis-dir)  GIS_DIR_OVERRIDE="$2"; shift 2 ;;
+    -h|--help)  usage 0 ;;
+    -*)         echo "Unknown flag: $1" >&2; usage ;;
+    *)          [[ -n "${TARGET}" ]] && { echo "Too many arguments" >&2; usage; }
+                TARGET="$1"; shift ;;
+  esac
+done
+
+[[ -z "${TARGET}" ]] && usage
+
+[[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
+source "${LIDAR_HOME}/lib/common.sh"
+source "${LIDAR_HOME}/lib/events.sh"
+
+RUN_ID=$(resolve_run_id "${TARGET}") || exit 1
+
+KML_DIR="${LIDAR_DIR}/kml/${RUN_ID}"
+KMZ_FILE="${LIDAR_DIR}/kmz/${RUN_ID}.kmz"
+LOG_FILE="${LIDAR_DIR}/logs/${RUN_ID}.log"
+
+printf '%s\n' "${RUN_ID}"
+
+fmt() { numfmt --to=iec --suffix=B --format='%.1f' "$1"; }
+
+row() {
+  local label="$1" note="$2" path="$3" bytes="$4"
+  printf '  %-10s  %-16s  %8s  %s\n' "${label}" "${note}" "$(fmt "${bytes}")" "${path}"
+}
+
+total_bytes=0
+
+# ─── DEM source tiles ────────────────────────────────────────────────────────
+# Projects are the leaf-level subdirectories under any shading in the pyramid.
+# Sizes come entirely from local filesystem — no URLs are fetched.
+# find -printf '%s\n' reads sizes from directory entries in one pass (fast at 10k+ tiles).
+dem_bytes=0
+dem_projects=()
+if [[ -d "${KML_DIR}" ]]; then
+  while IFS= read -r proj_dir; do
+    project="${proj_dir##*/}"
+    project_bytes=$(find "${DEM_DIR}" -maxdepth 1 -name "*${project}*.tif" \
+      -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
+    dem_bytes=$(( dem_bytes + project_bytes ))
+    dem_projects+=("${project}")
+  done < <(find "${KML_DIR}" -mindepth 3 -maxdepth 3 -type d | sort -u)
+fi
+
+if [[ ${dem_bytes} -gt 0 ]]; then
+  note="(shared, ${#dem_projects[@]} project(s))"
+  row "dem tiles" "${note}" "${DEM_DIR}" "${dem_bytes}"
+fi
+
+printf '  ──────────────────────────────────────────────────────\n'
+
+# ─── Pyramid, KMZ, log ───────────────────────────────────────────────────────
+if [[ -d "${KML_DIR}" ]]; then
+  bytes=$(du -sb "${KML_DIR}" | cut -f1)
+  row "pyramid" "" "${KML_DIR}" "${bytes}"
+  total_bytes=$(( total_bytes + bytes ))
+else
+  printf '  %-10s  (not found: %s)\n' "pyramid" "${KML_DIR}"
+fi
+
+if [[ -f "${KMZ_FILE}" ]]; then
+  bytes=$(stat -c '%s' "${KMZ_FILE}")
+  row "kmz" "" "${KMZ_FILE}" "${bytes}"
+  total_bytes=$(( total_bytes + bytes ))
+fi
+
+if [[ -f "${LOG_FILE}" ]]; then
+  bytes=$(stat -c '%s' "${LOG_FILE}")
+  row "log" "" "${LOG_FILE}" "${bytes}"
+  total_bytes=$(( total_bytes + bytes ))
+fi
+
+if [[ ${total_bytes} -gt 0 ]]; then
+  printf '  ──────────────────────────────────────────────────────\n'
+  printf '  %-10s  %-16s  %8s\n' "total" "(excl. dem)" "$(fmt "${total_bytes}")"
+fi
