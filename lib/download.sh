@@ -158,82 +158,63 @@ make_dirs() {
 }
 
 # ─── Step 4: download_tiles ──────────────────────────────────────────────────
-# Download every URL in FILTERED_LIST into DEM_DIR. Skips already-cached files.
-# Each tile's progress bar gets its own line with a percentage.
+# Downloads FILTERED_LIST into DEM_DIR using xargs -P for parallelism.
+# Set LIDAR_DOWNLOAD_JOBS (default 4) to control concurrency.
+#
+# Per-tile status lines are written via `flock /dev/stderr` so they don't
+# interleave. Per-tile percentage/EWMA ETA is not shown (meaningless when
+# many tiles run concurrently); use `lidar list` to track overall progress.
+
+# Per-URL worker called by xargs. Exported so the subshells inherit it.
+_lidar_download_one() {
+  local url="$1"
+  [[ -z "${url}" ]] && return 0
+  local basename="${url##*/}"; basename="${basename%.tif}"
+  local tile_tif="${DEM_DIR}/${basename}.tif"
+  if [[ -f "${tile_tif}" ]]; then
+    flock /dev/stderr -c "printf '  cached  %s\n' '${basename}'" 2>&1
+    return 0
+  fi
+  # PID-suffixed partial so concurrent invocations don't clobber each other.
+  # If another process finishes the tile first, drop our partial.
+  local partial="${tile_tif}.$$.partial"
+  if ! curl -L --retry 5 --retry-all-errors --retry-delay 5 \
+            --fail-with-body --max-time 1800 -C - -sS \
+            -o "${partial}" "${url}"; then
+    flock /dev/stderr -c "printf '  ERROR   %s\n' '${basename}'" 2>&1
+    rm -f "${partial}"
+    return 1
+  fi
+  if [[ -f "${tile_tif}" ]]; then
+    rm -f "${partial}"
+  else
+    mv -f "${partial}" "${tile_tif}"
+  fi
+  local sz
+  sz=$(stat -c %s "${tile_tif}" 2>/dev/null || echo 0)
+  flock /dev/stderr -c "printf '  done    %s  (%s)\n' '${basename}' '$(numfmt --to=iec --suffix=B --format=%.1f "${sz}")'" 2>&1
+}
+export -f _lidar_download_one
+
 download_tiles() {
+  local jobs="${LIDAR_DOWNLOAD_JOBS:-4}"
   echo "=========================================="
-  echo "STEP 4: Downloading ${TOTAL_TILES} tiles"
+  echo "STEP 4: Downloading ${TOTAL_TILES} tiles  (parallel: ${jobs})"
   echo "=========================================="
 
-  local PROCESSED=0
-  local ERRORS=0
-  local BYTES_DOWNLOADED="${BYTES_DONE}"
-  # EWMA download rate (bytes/sec). Seeds itself from the first completed
-  # tile, then updates per tile so recent slow patches fade quickly
-  # instead of poisoning the cumulative average forever.
-  local SMOOTHED_RATE=0
+  export DEM_DIR
 
-  while IFS= read -r URL; do
-    [[ -z "${URL}" ]] && continue
-
-    local BASENAME="${URL##*/}"; BASENAME="${BASENAME%.tif}"
-    local TILE_TIF="${DEM_DIR}/${BASENAME}.tif"
-    PROCESSED=$((PROCESSED + 1))
-
-    if [[ -f "${TILE_TIF}" ]]; then
-      printf "  [%d/%d] %s — cached\n" "${PROCESSED}" "${TOTAL_TILES}" "${BASENAME}"
-      continue
-    fi
-
-    local PCT="0"
-    if [[ "${BYTES_TOTAL_EST}" -gt 0 ]]; then
-      PCT=$(( BYTES_DOWNLOADED * 100 / BYTES_TOTAL_EST ))
-    fi
-    local ETA_STR="--"
-    if [[ ${SMOOTHED_RATE} -gt 0 ]]; then
-      local REMAINING=$(( BYTES_TOTAL_EST - BYTES_DOWNLOADED ))
-      (( REMAINING < 0 )) && REMAINING=0
-      ETA_STR=$(human_duration $(( REMAINING / SMOOTHED_RATE )))
-    fi
-    printf "  [%d/%d - %d%%] %s — [%s / ~%s] ETA ~%s\n" \
-      "${PROCESSED}" "${TOTAL_TILES}" "${PCT}" "${BASENAME}" \
-      "$(human_bytes "${BYTES_DOWNLOADED}")" "$(human_bytes "${BYTES_TOTAL_EST}")" \
-      "${ETA_STR}"
-    # PID-suffixed partial so concurrent background runs covering the same
-    # tile don't clobber each other's writes. Cross-run resume is sacrificed,
-    # but resume within a single run still works (-C -). If another run wins
-    # the race and the final file appears, drop our partial.
-    local PARTIAL="${TILE_TIF}.$$.partial"
-    local T0=${SECONDS}
-    if ! curl -L --retry 5 --retry-all-errors --retry-delay 5 \
-              --fail-with-body --max-time 1800 -C - -# \
-              -o "${PARTIAL}" "${URL}"; then
-      echo "  ERROR: download failed for ${URL}" >&2
-      ERRORS=$((ERRORS + 1))
-      rm -f "${PARTIAL}"
-      continue
-    fi
-    local TILE_ELAPSED=$(( SECONDS - T0 ))
-    (( TILE_ELAPSED < 1 )) && TILE_ELAPSED=1
-    if [[ -f "${TILE_TIF}" ]]; then
-      # Another concurrent run finished this tile while we were downloading.
-      rm -f "${PARTIAL}"
-    else
-      mv -f "${PARTIAL}" "${TILE_TIF}"
-    fi
-    local TILE_SIZE
-    TILE_SIZE=$(stat -c %s "${TILE_TIF}")
-    BYTES_DOWNLOADED=$((BYTES_DOWNLOADED + TILE_SIZE))
-    # EWMA update (alpha=0.3): seed on first sample, then blend.
-    local TILE_RATE=$(( TILE_SIZE / TILE_ELAPSED ))
-    if [[ ${SMOOTHED_RATE} -eq 0 ]]; then
-      SMOOTHED_RATE=${TILE_RATE}
-    else
-      SMOOTHED_RATE=$(( (TILE_RATE * 3 + SMOOTHED_RATE * 7) / 10 ))
-    fi
-  done < "${FILTERED_LIST}"
+  local rc=0
+  grep -v '^[[:space:]]*$' "${FILTERED_LIST}" \
+    | xargs -P "${jobs}" -n 1 bash -c '_lidar_download_one "$@"' _ \
+    || rc=$?
 
   echo "=========================================="
-  echo "STEP 4 complete — ${PROCESSED} tiles, ${ERRORS} errors"
+  if [[ ${rc} -ne 0 ]]; then
+    echo "STEP 4 complete — WARNING: some downloads failed (see above)"
+  else
+    echo "STEP 4 complete"
+  fi
   echo "=========================================="
+  return ${rc}
 }
