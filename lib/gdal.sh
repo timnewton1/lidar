@@ -59,8 +59,10 @@ derive_shading() {
 compute_max_zoom() {
   local tif="$1"
   local pixel_size
+  # `|| true` keeps pipefail from killing us under set -e if grep finds nothing;
+  # the empty-string check below handles the failure cleanly.
   pixel_size=$("${GDALINFO[@]}" "${tif}" 2>/dev/null \
-    | grep -oP 'Pixel Size = \(\K[0-9.eE+-]+')
+    | { grep -oP 'Pixel Size = \(\K[0-9.eE+-]+' || true; })
   [[ -z "${pixel_size}" ]] && { echo "ERROR: could not read pixel size from ${tif}" >&2; return 1; }
   awk -v px="${pixel_size}" 'BEGIN {
     z = log(360 / (256 * px)) / log(2)
