@@ -83,7 +83,7 @@ list_runs() {
         }
     ) | sort_by(.started) | reverse
     | .[] | [.id, .started, .ended, (.pid|tostring), .log,
-             (.exit // "" | tostring), .last_event] | join("")
+             (.exit // "" | tostring), .last_event] | join("")
   ' "${EVENTS_FILE}")
 
   # Walk rows, compute status (including PID liveness) and duration,

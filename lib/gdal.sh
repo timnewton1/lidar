@@ -18,7 +18,7 @@ derive_hillshade() {
     -z "${HS_Z_FACTOR}"
     -alg "${HS_ALGORITHM}"
     -compute_edges
-    -co COMPRESS=DEFLATE -co TILED=YES)
+    -co COMPRESS=DEFLATE -co TILED=YES -co BIGTIFF=YES)
   if [[ ${HS_MULTIDIRECTIONAL} -eq 1 ]]; then
     args+=(-multidirectional)
   else
@@ -34,13 +34,13 @@ derive_slopeshade() {
   local slope_tif="${out%.tif}_slope.tif"
   local ramp="${out%.tif}_ramp.txt"
   "${GDALDEM[@]}" slope "${in}" "${slope_tif}" \
-    -compute_edges -co COMPRESS=DEFLATE -co TILED=YES
+    -compute_edges -co COMPRESS=DEFLATE -co TILED=YES -co BIGTIFF=YES
   cat > "${ramp}" <<'RAMP'
 0   255 255 255
 90    0   0   0
 RAMP
   "${GDALDEM[@]}" color-relief "${slope_tif}" "${ramp}" "${out}" \
-    -co COMPRESS=DEFLATE -co TILED=YES
+    -co COMPRESS=DEFLATE -co TILED=YES -co BIGTIFF=YES
   rm -f "${slope_tif}" "${ramp}"
 }
 
@@ -58,7 +58,7 @@ reproject_to_wgs84() {
   local in="$1" out="$2"
   "${GDALWARP[@]}" -t_srs EPSG:4326 -r bilinear \
     -multi -wo NUM_THREADS=ALL_CPUS \
-    -co COMPRESS=DEFLATE -co TILED=YES \
+    -co COMPRESS=DEFLATE -co TILED=YES -co BIGTIFF=YES \
     "${in}" "${out}"
 }
 
