@@ -186,6 +186,13 @@ on_exit() {
   events_emit_end "${NAME}" "${rc}"
   [[ -n "${WORK_DIR:-}" ]] && rm -rf "${WORK_DIR}"
 }
+# When bash is signaled mid-wait, $? in the EXIT trap reads as 0 even though
+# the process exits 128+N — so killed runs were getting recorded as success.
+# Re-raise the signal via exit(128+N) so the EXIT trap sees the real status.
+on_signal() { exit "$(( 128 + $(kill -l "$1") ))"; }
+trap 'on_signal TERM' TERM
+trap 'on_signal INT'  INT
+trap 'on_signal HUP'  HUP
 trap on_exit EXIT
 
 cleanup_old_logs 30
