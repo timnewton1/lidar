@@ -72,9 +72,14 @@ compute_max_zoom() {
 }
 
 # ─── Reproject helper ────────────────────────────────────────────────────────
+# -srcnodata 0: gdaldem writes 0 for nodata pixels (single-band byte).
+# -dstalpha: bilinear can blend nodata=0 into real pixels near edges, leaving
+# a dark halo around the data. Generating an explicit alpha band from source
+# coverage means transparency is decoupled from grayscale values.
 reproject_to_wgs84() {
   local in="$1" out="$2"
   "${GDALWARP[@]}" -t_srs EPSG:4326 -r bilinear \
+    -srcnodata 0 -dstalpha \
     -multi -wo NUM_THREADS=ALL_CPUS \
     -co COMPRESS=DEFLATE -co TILED=YES -co BIGTIFF=YES \
     "${in}" "${out}"
