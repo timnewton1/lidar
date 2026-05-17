@@ -4,5 +4,5 @@
 [[ -n "${_LIDAR_STRICT_LOADED:-}" ]] && return 0
 _LIDAR_STRICT_LOADED=1
 set -Eeuo pipefail
-trap 'rc=$?; printf "\nERROR rc=%d at %s:%d in %s\n" "$rc" \
+trap 'rc=$?; printf "\nERROR rc=%d at %s:%s in %s\n" "$rc" \
   "${BASH_SOURCE[1]:-?}" "${BASH_LINENO[0]:-?}" "${FUNCNAME[1]:-main}" >&2' ERR
