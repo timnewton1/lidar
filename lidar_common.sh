@@ -62,6 +62,191 @@ is_known_shading() {
   return 1
 }
 
+# ─── Run-events index ────────────────────────────────────────────────────────
+# Single append-only JSONL file at $LIDAR_DIR/logs/runs.jsonl. Each line is
+# one event: {"id":...,"event":"start|end",...}. Status is derived from the
+# latest event per id, with PID liveness used to distinguish running vs
+# crashed. Append-only is crash-safe (<4KB writes are atomic with O_APPEND
+# on Linux), so two concurrent runs writing 'start' simultaneously won't
+# interleave.
+EVENTS_FILE="${LIDAR_DIR}/logs/runs.jsonl"
+
+# Minimal JSON string escape — handles the chars that actually show up in
+# run names, paths, and CLI args. Not a general-purpose JSON encoder.
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\t'/\\t}"
+  s="${s//$'\r'/\\r}"
+  printf '%s' "${s}"
+}
+
+events_emit_start() {
+  local id="$1" log="$2"; shift 2
+  mkdir -p "$(dirname "${EVENTS_FILE}")"
+  local ts; ts=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+  local args_json="[" first=1 a
+  for a in "$@"; do
+    [[ ${first} -eq 1 ]] || args_json+=","
+    args_json+="\"$(json_escape "${a}")\""
+    first=0
+  done
+  args_json+="]"
+  printf '{"id":"%s","event":"start","ts":"%s","pid":%d,"log":"%s","args":%s}\n' \
+    "$(json_escape "${id}")" "${ts}" "$$" "$(json_escape "${log}")" "${args_json}" \
+    >> "${EVENTS_FILE}"
+}
+
+events_emit_end() {
+  local id="$1" exit_code="$2"
+  mkdir -p "$(dirname "${EVENTS_FILE}")"
+  local ts; ts=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+  printf '{"id":"%s","event":"end","ts":"%s","exit":%d}\n' \
+    "$(json_escape "${id}")" "${ts}" "${exit_code}" \
+    >> "${EVENTS_FILE}"
+}
+
+# Delete run logs older than N days. Events file is preserved (tiny).
+# Default 30 days; failed runs covered by the same blanket retention since
+# they're usually fixed within days, not months.
+cleanup_old_logs() {
+  local days="${1:-30}"
+  local log_dir="${LIDAR_DIR}/logs"
+  [[ -d "${log_dir}" ]] || return 0
+  find "${log_dir}" -maxdepth 1 -type f -name '*.log' \
+    -mtime "+${days}" -delete 2>/dev/null || true
+}
+
+# ─── --list-runs implementation ──────────────────────────────────────────────
+# Args: filter_status limit since_secs show_all json_mode
+# Empty filter_status = all statuses; show_all=1 disables limit.
+list_runs() {
+  local filter_status="$1" limit="${2:-20}" since_secs="$3" show_all="$4" json_mode="$5"
+
+  command -v jq >/dev/null || {
+    echo "ERROR: --list-runs requires jq (sudo dnf install jq)" >&2
+    exit 1
+  }
+  if [[ ! -f "${EVENTS_FILE}" ]]; then
+    [[ "${json_mode}" == "1" ]] && echo "[]" || echo "(no runs yet)"
+    return
+  fi
+
+  local now_epoch; now_epoch=$(date +%s)
+
+  # jq collapses events to per-id rows: id, started, ended, pid, log, exit, last_event
+  # Sorted newest-first. Fields joined by ASCII US (0x1F) — non-whitespace, so
+  # bash IFS preserves empty fields (tabs collapse under default whitespace IFS).
+  local rows
+  rows=$(jq -s -r '
+    group_by(.id) | map(
+      (map(select(.event=="start"))[0]) as $s
+      | .[-1] as $last
+      | {
+          id: ($s.id // $last.id),
+          started: ($s.ts // ""),
+          ended: (if $last.event=="end" then $last.ts else "" end),
+          pid: ($s.pid // 0),
+          log: ($s.log // ""),
+          exit: (if $last.event=="end" then $last.exit else null end),
+          last_event: $last.event
+        }
+    ) | sort_by(.started) | reverse
+    | .[] | [.id, .started, .ended, (.pid|tostring), .log,
+             (.exit // "" | tostring), .last_event] | join("")
+  ' "${EVENTS_FILE}")
+
+  # Walk rows, compute status (including PID liveness) and duration,
+  # apply filters, accumulate.
+  local out_rows=()
+  local count=0
+  while IFS=$'\x1f' read -r id started ended pid log exit_code last_event; do
+    [[ -z "${id}" ]] && continue
+    local status
+    if [[ "${last_event}" == "end" ]]; then
+      [[ "${exit_code}" == "0" ]] && status="success" || status="failed"
+    else
+      if [[ "${pid}" -gt 0 ]] && kill -0 "${pid}" 2>/dev/null; then
+        status="running"
+      else
+        status="crashed"
+      fi
+    fi
+
+    [[ -n "${filter_status}" && "${filter_status}" != "${status}" ]] && continue
+
+    local start_epoch; start_epoch=$(date -d "${started}" +%s 2>/dev/null || echo 0)
+    if [[ -n "${since_secs}" && ${start_epoch} -gt 0 ]]; then
+      (( now_epoch - start_epoch > since_secs )) && continue
+    fi
+
+    local dur
+    if [[ -n "${ended}" ]]; then
+      local end_epoch; end_epoch=$(date -d "${ended}" +%s 2>/dev/null || echo "${now_epoch}")
+      dur=$(( end_epoch - start_epoch ))
+    else
+      dur=$(( now_epoch - start_epoch ))
+    fi
+    (( dur < 0 )) && dur=0
+
+    out_rows+=("${status}|${started}|${dur}|${id}|${log}|${exit_code}|${pid}")
+    count=$((count + 1))
+    if [[ "${show_all}" != "1" && ${count} -ge ${limit} ]]; then break; fi
+  done <<< "${rows}"
+
+  if [[ "${json_mode}" == "1" ]]; then
+    # Re-emit filtered set as JSON
+    local first=1
+    printf '['
+    for r in "${out_rows[@]+"${out_rows[@]}"}"; do
+      IFS='|' read -r status started dur id log exit_code pid <<< "${r}"
+      [[ ${first} -eq 1 ]] || printf ','
+      printf '{"status":"%s","started":"%s","duration_sec":%d,"id":"%s","log":"%s","exit":%s,"pid":%d}' \
+        "${status}" "${started}" "${dur}" "$(json_escape "${id}")" "$(json_escape "${log}")" \
+        "${exit_code:-null}" "${pid}"
+      first=0
+    done
+    printf ']\n'
+    return
+  fi
+
+  if [[ ${#out_rows[@]} -eq 0 ]]; then
+    echo "(no matching runs)"
+    return
+  fi
+
+  # Color only on TTY
+  local C_RESET="" C_OK="" C_FAIL="" C_RUN="" C_CRASH=""
+  if [[ -t 1 ]]; then
+    C_RESET=$'\033[0m'
+    C_OK=$'\033[32m'     # green
+    C_FAIL=$'\033[31m'   # red
+    C_RUN=$'\033[33m'    # yellow
+    C_CRASH=$'\033[35m'  # magenta
+  fi
+
+  printf "%-9s  %-19s  %9s  %-24s  %s\n" "STATUS" "STARTED" "DURATION" "NAME" "LOG"
+  for r in "${out_rows[@]}"; do
+    IFS='|' read -r status started dur id log exit_code pid <<< "${r}"
+    local sym color
+    case "${status}" in
+      success) sym="✓ ok";    color="${C_OK}" ;;
+      failed)  sym="✗ fail";  color="${C_FAIL}" ;;
+      running) sym="⏱ run";   color="${C_RUN}" ;;
+      crashed) sym="⊘ crash"; color="${C_CRASH}" ;;
+      *)       sym="${status}"; color="" ;;
+    esac
+    # 2026-05-16T22:14:03Z → 2026-05-16 22:14:03
+    local started_h="${started/T/ }"; started_h="${started_h%Z}"
+    local dur_h; dur_h=$(human_duration "${dur}")
+    local log_base="${log##*/}"
+    printf "${color}%-9s${C_RESET}  %-19s  %9s  %-24s  %s\n" \
+      "${sym}" "${started_h}" "${dur_h}" "${id}" "${log_base}"
+  done
+}
+
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 human_bytes() { numfmt --to=iec --suffix=B --format='%.1f' "$1"; }
 

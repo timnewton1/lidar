@@ -14,7 +14,14 @@
 #   --kmz                also package the pyramid into a portable .kmz file
 #   --background         detach and run in the background; log to
 #                        $GIS_DIR/lidar/logs/<name>.log. Prints PID + log path.
-#   --list-running       list active background runs (PID, log path) and exit
+#   --list-runs          list runs from the events log: STATUS, STARTED,
+#                        DURATION, NAME, LOG. Supports:
+#                          --status running|success|failed|crashed
+#                          -n N / --limit N    (default 20)
+#                          --since 7d|24h|30m  (filter by recency)
+#                          --all               (no limit)
+#                          --json              (machine output)
+#   --list-running       alias for --list-runs --status running
 #   --install-service N  install as a systemd --user service named N
 #                        (auto-restarts, survives reboot). Forwards all other
 #                        flags + the URL/list to the unit's env file.
@@ -31,7 +38,7 @@
 set -euo pipefail
 
 usage() {
-  sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-1}"
 }
 
@@ -43,12 +50,30 @@ DOWNLOAD_LIST=""
 ALGORITHM=""
 MULTIDIRECTIONAL=0
 BACKGROUND=0
-LIST_RUNNING=0
+LIST_RUNS=0
 INSTALL_SERVICE=""
 UNINSTALL_SERVICE=""
 KILL_ALL=0
+LR_STATUS=""
+LR_LIMIT=20
+LR_SINCE=""
+LR_ALL=0
+LR_JSON=0
 
 ORIG_ARGS=("$@")
+
+# Parse human duration suffixes: 30m, 24h, 7d → seconds.
+parse_duration() {
+  local s="$1" n="${1%[smhd]}" u="${1: -1}"
+  [[ "${s}" =~ ^[0-9]+[smhd]?$ ]] || { echo "bad duration: ${s}" >&2; exit 1; }
+  case "${u}" in
+    s) echo $((n)) ;;
+    m) echo $((n * 60)) ;;
+    h) echo $((n * 3600)) ;;
+    d) echo $((n * 86400)) ;;
+    *) echo $((s)) ;;
+  esac
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -59,7 +84,13 @@ while [[ $# -gt 0 ]]; do
     --gis-dir)            GIS_DIR_OVERRIDE="$2"; shift 2 ;;
     --kmz)                PACKAGE_KMZ=1; shift ;;
     --background)         BACKGROUND=1; shift ;;
-    --list-running)       LIST_RUNNING=1; shift ;;
+    --list-runs)          LIST_RUNS=1; shift ;;
+    --list-running)       LIST_RUNS=1; LR_STATUS="running"; shift ;;
+    --status)             LR_STATUS="$2"; shift 2 ;;
+    -n|--limit)           LR_LIMIT="$2"; shift 2 ;;
+    --since)              LR_SINCE="$2"; shift 2 ;;
+    --all)                LR_ALL=1; shift ;;
+    --json)               LR_JSON=1; shift ;;
     --install-service)    INSTALL_SERVICE="$2"; shift 2 ;;
     --uninstall-service)  UNINSTALL_SERVICE="$2"; shift 2 ;;
     --kill-all)           KILL_ALL=1; shift ;;
@@ -70,6 +101,12 @@ while [[ $# -gt 0 ]]; do
       DOWNLOAD_LIST="$1"; shift ;;
   esac
 done
+
+[[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
+
+SCRIPT_DIR=$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=lidar_common.sh
+source "${SCRIPT_DIR}/lidar_common.sh"
 
 # ─── --uninstall-service: stop + disable + remove env file, then exit ────────
 if [[ -n "${UNINSTALL_SERVICE}" ]]; then
@@ -151,24 +188,27 @@ if [[ -n "${INSTALL_SERVICE}" ]]; then
   exit 0
 fi
 
-# ─── --kill-all: stop everything lidar-related and exit ─────────────────────
+# ─── --kill-all: stop every active run, sourced from the events file ────────
 if [[ ${KILL_ALL} -eq 1 ]]; then
-  EFFECTIVE_GIS_DIR="${GIS_DIR_OVERRIDE:-${GIS_DIR:-}}"
   killed=0
 
-  # 1) Background sidecars under $GIS_DIR/lidar/logs/*.log.pid
-  if [[ -n "${EFFECTIVE_GIS_DIR}" && -d "${EFFECTIVE_GIS_DIR}/lidar/logs" ]]; then
-    shopt -s nullglob
-    for pidfile in "${EFFECTIVE_GIS_DIR}/lidar/logs"/*.log.pid; do
-      pid=$(cat "${pidfile}" 2>/dev/null || true)
-      if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-        echo "  TERM background PID ${pid} (${pidfile%.pid})"
+  # 1) Live runs per the events index (status=running implies PID alive).
+  if [[ -f "${EVENTS_FILE}" ]] && command -v jq >/dev/null; then
+    while IFS=$'\x1f' read -r id pid; do
+      [[ -z "${pid}" || "${pid}" == "0" ]] && continue
+      if kill -0 "${pid}" 2>/dev/null; then
+        echo "  TERM PID ${pid} (${id})"
         kill -TERM "${pid}" 2>/dev/null || true
         killed=$((killed + 1))
       fi
-      rm -f "${pidfile}"
-    done
-    shopt -u nullglob
+    done < <(jq -s -r '
+      group_by(.id) | map(
+        (map(select(.event=="start"))[0]) as $s
+        | .[-1] as $last
+        | select($last.event != "end")
+        | [$s.id, ($s.pid|tostring)] | join("")
+      ) | .[]
+    ' "${EVENTS_FILE}")
   fi
 
   # 2) systemd --user services: lidar-hillshade@*.service
@@ -182,10 +222,9 @@ if [[ ${KILL_ALL} -eq 1 ]]; then
              'lidar-hillshade@*.service' 2>/dev/null | awk '{print $1}')
   fi
 
-  # 3) Stray lidar_hillshade.sh processes not caught above (e.g. manual nohup).
-  #    Exclude self ($$), parent shell, and pgrep itself (its own cmdline
-  #    contains our pattern). Use /proc/PID/comm — kernel-tracked basename —
-  #    so '/usr/bin/pgrep' is detected reliably.
+  # 3) Stray lidar_hillshade.sh processes the events index doesn't know about
+  #    (e.g. a manual nohup from before events were added). Exclude self,
+  #    parent shell, and pgrep itself.
   while IFS= read -r p; do
     [[ -z "${p}" || "${p}" == "$$" || "${p}" == "${PPID}" ]] && continue
     comm=$(cat "/proc/${p}/comm" 2>/dev/null || true)
@@ -197,38 +236,17 @@ if [[ ${KILL_ALL} -eq 1 ]]; then
     fi
   done < <(pgrep -f 'lidar_hillshade\.sh' 2>/dev/null || true)
 
-  if [[ ${killed} -eq 0 ]]; then
-    echo "Nothing to kill."
-  else
-    echo "Sent TERM to ${killed} target(s)."
+  if [[ ${killed} -eq 0 ]]; then echo "Nothing to kill."
+  else echo "Sent TERM to ${killed} target(s)."
   fi
   exit 0
 fi
 
-# ─── --list-running: scan PID sidecars and exit ──────────────────────────────
-if [[ ${LIST_RUNNING} -eq 1 ]]; then
-  EFFECTIVE_GIS_DIR="${GIS_DIR_OVERRIDE:-${GIS_DIR:-}}"
-  [[ -z "${EFFECTIVE_GIS_DIR}" ]] && { echo "ERROR: GIS_DIR not set" >&2; exit 1; }
-  LOG_DIR="${EFFECTIVE_GIS_DIR}/lidar/logs"
-  if [[ ! -d "${LOG_DIR}" ]]; then
-    echo "No background runs (no ${LOG_DIR})"
-    exit 0
-  fi
-  shopt -s nullglob
-  COUNT=0
-  printf "%-8s  %-19s  %s\n" "PID" "STARTED" "LOG"
-  for pidfile in "${LOG_DIR}"/*.log.pid; do
-    pid=$(cat "${pidfile}" 2>/dev/null || true)
-    [[ -z "${pid}" ]] && continue
-    if kill -0 "${pid}" 2>/dev/null; then
-      started=$(stat -c %y "${pidfile}" 2>/dev/null | cut -d. -f1)
-      printf "%-8s  %-19s  %s\n" "${pid}" "${started}" "${pidfile%.pid}"
-      COUNT=$((COUNT + 1))
-    else
-      rm -f "${pidfile}"
-    fi
-  done
-  [[ ${COUNT} -eq 0 ]] && echo "(none)"
+# ─── --list-runs: pretty-print the events index ──────────────────────────────
+if [[ ${LIST_RUNS} -eq 1 ]]; then
+  SINCE_SECS=""
+  [[ -n "${LR_SINCE}" ]] && SINCE_SECS=$(parse_duration "${LR_SINCE}")
+  list_runs "${LR_STATUS}" "${LR_LIMIT}" "${SINCE_SECS}" "${LR_ALL}" "${LR_JSON}"
   exit 0
 fi
 
@@ -258,17 +276,11 @@ if [[ ${BACKGROUND} -eq 1 ]]; then
   echo "  Log : ${LOG_FILE}"
   nohup "${BASH_SOURCE[0]}" "${CHILD_ARGS[@]}" >"${LOG_FILE}" 2>&1 </dev/null &
   CHILD_PID=$!
-  echo "${CHILD_PID}" > "${LOG_FILE}.pid"
   echo "  PID : ${CHILD_PID}"
+  echo "  (tracked in events index — see --list-runs)"
   disown
   exit 0
 fi
-
-[[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
-
-SCRIPT_DIR=$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)
-# shellcheck source=lidar_common.sh
-source "${SCRIPT_DIR}/lidar_common.sh"
 
 # ─── Parse + validate shadings ───────────────────────────────────────────────
 IFS=',' read -r -a SHADINGS <<< "${SHADINGS_CSV}"
@@ -306,6 +318,25 @@ if ! flock -n "${LOCK_FD}"; then
 fi
 echo $$ > "${LOCK_FILE}"
 
+# ─── Events: emit 'start' now and 'end' on exit (with exit code) ────────────
+# Record the actual stdout destination if known; empty otherwise.
+EVENT_LOG_PATH=""
+if [[ ! -t 1 ]]; then
+  EVENT_LOG_PATH=$(readlink -f /proc/self/fd/1 2>/dev/null || true)
+  [[ "${EVENT_LOG_PATH}" == /dev/* ]] && EVENT_LOG_PATH=""
+fi
+events_emit_start "${NAME}" "${EVENT_LOG_PATH}" "${ORIG_ARGS[@]}"
+
+on_exit() {
+  local rc=$?
+  events_emit_end "${NAME}" "${rc}"
+  [[ -n "${WORK_DIR:-}" ]] && rm -rf "${WORK_DIR}"
+}
+trap on_exit EXIT
+
+# ─── Retention: prune log files older than 30 days at the top of every run ──
+cleanup_old_logs 30
+
 KML_DIR="${LIDAR_DIR}/kml"
 OUT_DIR="${KML_DIR}/${NAME}"
 
@@ -317,7 +348,6 @@ fi
 
 # Flatpak sandbox cannot read /tmp — work dir must live under LIDAR_DIR.
 WORK_DIR=$(mktemp -d "${LIDAR_DIR}/.work_XXXXXX")
-trap 'rm -rf "${WORK_DIR}"' EXIT
 
 extra_deps=()
 [[ ${PACKAGE_KMZ} -eq 1 ]] && extra_deps+=(zip)
