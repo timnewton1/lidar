@@ -47,6 +47,33 @@ cleanup_old_logs() {
     -mtime "+${days}" -delete 2>/dev/null || true
 }
 
+# ─── Run ID resolver ─────────────────────────────────────────────────────────
+# Accepts a full run ID or a bare hex suffix; prints the resolved ID.
+# Errors (to stderr) and returns 1 on no match or ambiguity.
+resolve_run_id() {
+  local query="$1"
+  command -v jq >/dev/null || { echo "ERROR: jq required" >&2; return 1; }
+  [[ -f "${EVENTS_FILE}" ]] || { echo "ERROR: no runs recorded yet" >&2; return 1; }
+
+  local matches
+  matches=$(jq -rs --arg q "${query}" '
+    [ .[] | select(.event=="start") | .id ] | unique
+    | .[] | select(. == $q or endswith("_" + $q))
+  ' "${EVENTS_FILE}")
+
+  local count=0
+  [[ -n "${matches}" ]] && count=$(echo "${matches}" | wc -l)
+
+  if [[ ${count} -eq 0 ]]; then
+    echo "ERROR: no run matching '${query}'" >&2; return 1
+  elif [[ ${count} -gt 1 ]]; then
+    echo "ERROR: '${query}' is ambiguous, matches:" >&2
+    echo "${matches}" | sed 's/^/  /' >&2; return 1
+  fi
+
+  echo "${matches}"
+}
+
 # ─── --list-runs implementation ──────────────────────────────────────────────
 # Args: filter_status limit since_secs show_all json_mode
 # Empty filter_status = all statuses; show_all=1 disables limit.
