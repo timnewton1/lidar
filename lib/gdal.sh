@@ -53,6 +53,22 @@ derive_shading() {
   esac
 }
 
+# Compute the WorldCRS84Quad max zoom that matches a raster's native resolution.
+# Reads pixel size from gdalinfo, applies round(log2(360/(256*px))), caps at 22.
+# Usage: max_zoom=$(compute_max_zoom path/to/wgs84.tif)
+compute_max_zoom() {
+  local tif="$1"
+  local pixel_size
+  pixel_size=$("${GDALINFO[@]}" "${tif}" 2>/dev/null \
+    | grep -oP 'Pixel Size = \(\K[0-9.eE+-]+')
+  [[ -z "${pixel_size}" ]] && { echo "ERROR: could not read pixel size from ${tif}" >&2; return 1; }
+  awk -v px="${pixel_size}" 'BEGIN {
+    z = log(360 / (256 * px)) / log(2)
+    z = int(z + 0.5)  # round to nearest: preserves native res without upsampling
+    print (z > 22) ? 22 : (z < 1) ? 1 : z
+  }'
+}
+
 # ─── Reproject helper ────────────────────────────────────────────────────────
 reproject_to_wgs84() {
   local in="$1" out="$2"
