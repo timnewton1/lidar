@@ -284,19 +284,27 @@ for SHADING in "${SHADINGS[@]}"; do
     reproject_to_wgs84 "${SHADE_TIF}" "${WGS84_TIF}"
 
     echo "  Building tile pyramid..."
-    # max-zoom explicit: gdal raster tile auto-detect rounds down by one
-    # for sub-meter data (OSGeo/gdal#2799, #3460). min-zoom is left to
-    # auto-pick — gdal's choice (data shrinks to ~one tile) is correct.
-    # cubic resampling preserves alpha-edge fidelity; average bled nodata
-    # into neighbors across overview levels and produced halo artifacts.
-    # PNG default preserves the alpha band from reproject_to_wgs84;
-    # --skip-blank drops fully-transparent tiles.
+    # min-zoom=0: gdal's auto-pick is "data fits in ~1 tile" which lands
+    # at zoom 7-8 for county-sized data. Tiles that small (≤1° on a side)
+    # fall under Google Earth's default 128-px LOD threshold at typical
+    # viewing altitudes, so the overlay stays invisible until you zoom
+    # deep in. Forcing min-zoom=0 produces overview tiles that span tens
+    # of degrees — easily clearing the LOD threshold at any altitude.
+    # --skip-blank drops the mostly-empty overview tiles for small data
+    # (PNG transparency compresses to ~nothing anyway), so storage cost
+    # is a handful of extra tiles per super-overlay.
+    #
+    # max-zoom explicit: gdal's auto-pick rounds down by one for sub-
+    # meter data (OSGeo/gdal#2799, #3460), so we still compute it.
+    # cubic resampling preserves alpha-edge fidelity; average bled
+    # nodata into neighbors across overview levels and produced halos.
     MAX_ZOOM=$(compute_max_zoom "${WGS84_TIF}")
-    echo "  Max zoom: ${MAX_ZOOM} (native resolution)"
+    echo "  Zoom range: 0-${MAX_ZOOM} (min=world, max=native resolution)"
     "${GDAL[@]}" raster tile \
       --tiling-scheme WorldCRS84Quad \
       --kml \
       --webviewer none \
+      --min-zoom 0 \
       --max-zoom "${MAX_ZOOM}" \
       -r cubic \
       --overview-resampling cubic \
