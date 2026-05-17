@@ -284,24 +284,22 @@ for SHADING in "${SHADINGS[@]}"; do
     reproject_to_wgs84 "${SHADE_TIF}" "${WGS84_TIF}"
 
     echo "  Building tile pyramid..."
-    MAX_ZOOM=$(compute_max_zoom "${WGS84_TIF}")
-    MIN_ZOOM=$(compute_min_zoom "${WGS84_TIF}" "${MAX_ZOOM}")
-    echo "  Zoom range: ${MIN_ZOOM}-${MAX_ZOOM} (min sized to data extent, max=native)"
-    # min-zoom is data-extent-aware: a fixed value (e.g. 5) puts a 5.625°
-    # tile at the lowest level — and that tile's bounds become the doc.kml
-    # bounding box, claiming several-hundred-km rectangles around county-
-    # sized datasets. Sizing it so ~3 tiles span the data keeps the
-    # bounding box close to actual coverage.
-    # Default PNG output preserves the alpha band from reproject_to_wgs84;
+    # max-zoom explicit: gdal raster tile auto-detect rounds down by one
+    # for sub-meter data (OSGeo/gdal#2799, #3460). min-zoom is left to
+    # auto-pick — gdal's choice (data shrinks to ~one tile) is correct.
+    # cubic resampling preserves alpha-edge fidelity; average bled nodata
+    # into neighbors across overview levels and produced halo artifacts.
+    # PNG default preserves the alpha band from reproject_to_wgs84;
     # --skip-blank drops fully-transparent tiles.
+    MAX_ZOOM=$(compute_max_zoom "${WGS84_TIF}")
+    echo "  Max zoom: ${MAX_ZOOM} (native resolution)"
     "${GDAL[@]}" raster tile \
       --tiling-scheme WorldCRS84Quad \
       --kml \
       --webviewer none \
-      --min-zoom "${MIN_ZOOM}" \
       --max-zoom "${MAX_ZOOM}" \
-      -r average \
-      --overview-resampling average \
+      -r cubic \
+      --overview-resampling cubic \
       --skip-blank \
       --title "${PROJECT}" \
       -j ALL_CPUS \
@@ -311,36 +309,42 @@ for SHADING in "${SHADINGS[@]}"; do
   done
 done
 
-# ─── Step 7: Write KML index ──────────────────────────────────────────────────
-echo "=========================================="
-echo "STEP 7: Writing KML index"
-echo "=========================================="
-
-for SHADING in "${SHADINGS[@]}"; do
-  write_shading_kml "${OUT_DIR}/${SHADING}/doc.kml" "${SHADING}" "${PROJECT_NAMES[@]}"
-done
-ROOT_KML="${OUT_DIR}/doc.kml"
-write_root_kml "${ROOT_KML}" "${NAME}" "${SHADINGS[@]}"
-
-# ─── Step 8: Optional KMZ packaging ──────────────────────────────────────────
-KMZ_OUT=""
+# ─── Step 7: Optional KMZ packaging (one .kmz per super-overlay) ─────────────
+# A KMZ archive expects exactly one doc.kml at its root. Each (shading,
+# project) super-overlay is independently complete, so we ship one KMZ
+# per super-overlay rather than zipping the whole tree.
+KMZ_PATHS=()
 if [[ ${PACKAGE_KMZ} -eq 1 ]]; then
   echo "=========================================="
-  echo "STEP 8: Packaging KMZ"
+  echo "STEP 7: Packaging KMZ (one per super-overlay)"
   echo "=========================================="
-  KMZ_DIR="${LIDAR_DIR}/kmz"
+  KMZ_DIR="${LIDAR_DIR}/kmz/${NAME}"
   mkdir -p "${KMZ_DIR}"
-  KMZ_OUT="${KMZ_DIR}/${NAME}.kmz"
-  package_kmz "${OUT_DIR}" "${KMZ_OUT}"
-  echo "  KMZ: ${KMZ_OUT} ($(human_bytes "$(stat -c %s "${KMZ_OUT}")"))"
+  for SHADING in "${SHADINGS[@]}"; do
+    for PROJECT in "${PROJECT_NAMES[@]}"; do
+      SRC="${OUT_DIR}/${SHADING}/${PROJECT}"
+      KMZ_OUT="${KMZ_DIR}/${SHADING}__${PROJECT}.kmz"
+      package_kmz "${SRC}" "${KMZ_OUT}"
+      echo "  ${SHADING}/${PROJECT}: ${KMZ_OUT} ($(human_bytes "$(stat -c %s "${KMZ_OUT}")"))"
+      KMZ_PATHS+=("${KMZ_OUT}")
+    done
+  done
 fi
 
 echo "=========================================="
 echo "ALL DONE"
+echo "=========================================="
+echo "Pyramid root : ${OUT_DIR}/  ($(du -sh "${OUT_DIR}" | cut -f1))"
 echo ""
-echo "Root KML : ${ROOT_KML}"
-echo "Pyramid  : ${OUT_DIR}/  ($(du -sh "${OUT_DIR}" | cut -f1))"
-[[ -n "${KMZ_OUT}" ]] && echo "Portable : ${KMZ_OUT}"
-echo ""
-echo "Open in Google Earth Pro via File → Open"
+echo "Super-overlays (open any in Google Earth via File → Open):"
+for SHADING in "${SHADINGS[@]}"; do
+  for PROJECT in "${PROJECT_NAMES[@]}"; do
+    echo "  ${OUT_DIR}/${SHADING}/${PROJECT}/doc.kml"
+  done
+done
+if [[ ${#KMZ_PATHS[@]} -gt 0 ]]; then
+  echo ""
+  echo "Portable KMZ files:"
+  for k in "${KMZ_PATHS[@]}"; do echo "  ${k}"; done
+fi
 echo "=========================================="

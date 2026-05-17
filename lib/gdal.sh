@@ -14,12 +14,6 @@ WCQ_TILE_DEG_Z0=180   # tile span in degrees at zoom 0
 WCQ_TILE_PX=256       # tile dimension in pixels
 
 # ─── Zoom-range tuning ───────────────────────────────────────────────────────
-# How many tiles span the data extent at min zoom — a few tiles gives a
-# tight doc.kml bounding box while still being visible at regional zoom.
-ZOOM_MIN_TILES_PER_SIDE=3
-# Always keep at least this many overview levels below max zoom, even when
-# the data is small enough that the extent-derived min would crowd it.
-ZOOM_MIN_OVERVIEW_LEVELS=3
 # Hard ceiling on max zoom — guards against pathological inputs (sub-cm
 # pixels) creating thousands of tiles. WorldCRS84Quad z=22 ≈ 2.6 cm/pixel.
 ZOOM_MAX_CAP=22
@@ -97,29 +91,6 @@ compute_max_zoom() {
     z = int(raw); if (raw > z) z++   # ceil
     if (z > cap) z = cap
     if (z < 1)   z = 1
-    print z
-  }'
-}
-
-# compute_min_zoom: lowest zoom where ~ZOOM_MIN_TILES_PER_SIDE tiles span the
-# data extent. Matters because the doc.kml bounding box is the union of the
-# lowest-zoom tiles touching the data: too coarse a min zoom and a county-
-# sized dataset claims a several-hundred-km rectangle. Solving
-# (wdeg / 2^z) = ext / N  →  z = log2(N * wdeg / ext).
-# Then clamped to leave at least ZOOM_MIN_OVERVIEW_LEVELS below max_zoom.
-# Usage: min_zoom=$(compute_min_zoom path/to/wgs84.tif <max_zoom>)
-compute_min_zoom() {
-  local tif="$1" max_zoom="$2" SIZE_X SIZE_Y PIXEL_SIZE
-  [[ -n "${max_zoom}" ]] || { echo "ERROR: compute_min_zoom requires max_zoom arg" >&2; return 1; }
-  _read_raster_dims "${tif}" || { echo "ERROR: could not read raster dims from ${tif}" >&2; return 1; }
-  awk -v sx="${SIZE_X}" -v sy="${SIZE_Y}" -v px="${PIXEL_SIZE}" \
-      -v wdeg="${WCQ_TILE_DEG_Z0}" -v n="${ZOOM_MIN_TILES_PER_SIDE}" \
-      -v maxz="${max_zoom}" -v floor_gap="${ZOOM_MIN_OVERVIEW_LEVELS}" 'BEGIN {
-    ext = (sx > sy ? sx : sy) * px           # data extent in degrees
-    z = log(n * wdeg / ext) / log(2)
-    z = int(z + 0.5)                         # round to nearest
-    if (z < 1) z = 1
-    if (z > maxz - floor_gap) z = maxz - floor_gap
     print z
   }'
 }
