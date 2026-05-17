@@ -278,18 +278,20 @@ for SHADING in "${SHADINGS[@]}"; do
 
     echo "  Building tile pyramid..."
     MAX_ZOOM=$(compute_max_zoom "${WGS84_TIF}")
-    echo "  Max zoom: ${MAX_ZOOM} (native resolution)"
-    # --min-zoom 5: overview tiles down to ~300km/tile, visible at any altitude.
-    # --max-zoom: computed from actual WGS84 pixel size so it's always native
-    # resolution regardless of source dataset or latitude.
-    # Default PNG output preserves the alpha band from reproject_to_wgs84.
-    # --skip-blank drops fully-transparent tiles (huge wins for scattered
-    # projects where the bounding box is mostly nodata).
+    MIN_ZOOM=$(compute_min_zoom "${WGS84_TIF}" "${MAX_ZOOM}")
+    echo "  Zoom range: ${MIN_ZOOM}-${MAX_ZOOM} (min sized to data extent, max=native)"
+    # min-zoom is data-extent-aware: a fixed value (e.g. 5) puts a 5.625°
+    # tile at the lowest level — and that tile's bounds become the doc.kml
+    # bounding box, claiming several-hundred-km rectangles around county-
+    # sized datasets. Sizing it so ~3 tiles span the data keeps the
+    # bounding box close to actual coverage.
+    # Default PNG output preserves the alpha band from reproject_to_wgs84;
+    # --skip-blank drops fully-transparent tiles.
     "${GDAL[@]}" raster tile \
       --tiling-scheme WorldCRS84Quad \
       --kml \
       --webviewer none \
-      --min-zoom 5 \
+      --min-zoom "${MIN_ZOOM}" \
       --max-zoom "${MAX_ZOOM}" \
       -r average \
       --overview-resampling average \
