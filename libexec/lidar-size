@@ -36,7 +36,7 @@ source "${LIDAR_HOME}/lib/events.sh"
 RUN_ID=$(resolve_run_id "${TARGET}") || exit 1
 
 KML_DIR="${LIDAR_DIR}/kml/${RUN_ID}"
-KMZ_FILE="${LIDAR_DIR}/kmz/${RUN_ID}.kmz"
+KMZ_DIR="${LIDAR_DIR}/kmz/${RUN_ID}"
 LOG_FILE="${LIDAR_DIR}/logs/${RUN_ID}.log"
 
 printf '%s\n' "${RUN_ID}"
@@ -82,10 +82,19 @@ else
   printf '  %-10s  (not found: %s)\n' "pyramid" "${KML_DIR}"
 fi
 
-if [[ -f "${KMZ_FILE}" ]]; then
-  bytes=$(stat -c '%s' "${KMZ_FILE}")
-  row "kmz" "" "${KMZ_FILE}" "${bytes}"
-  total_bytes=$(( total_bytes + bytes ))
+if [[ -d "${KMZ_DIR}" ]]; then
+  kmz_count=0
+  kmz_bytes=0
+  while IFS= read -r f; do
+    [[ -z "${f}" ]] && continue
+    sz=$(stat -c '%s' "${f}")
+    kmz_bytes=$(( kmz_bytes + sz ))
+    kmz_count=$(( kmz_count + 1 ))
+  done < <(find "${KMZ_DIR}" -maxdepth 1 -type f -name '*.kmz')
+  if [[ ${kmz_count} -gt 0 ]]; then
+    row "kmz" "(${kmz_count} file(s))" "${KMZ_DIR}" "${kmz_bytes}"
+    total_bytes=$(( total_bytes + kmz_bytes ))
+  fi
 fi
 
 if [[ -f "${LOG_FILE}" ]]; then
