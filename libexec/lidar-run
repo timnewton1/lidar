@@ -76,12 +76,20 @@ if [[ ${BACKGROUND} -eq 1 ]]; then
   [[ -z "${EFFECTIVE_GIS_DIR}" ]] && { echo "ERROR: GIS_DIR not set" >&2; exit 1; }
   LOG_DIR="${EFFECTIVE_GIS_DIR}/lidar/logs"
   mkdir -p "${LOG_DIR}"
-  LOG_NAME="${NAME:-superoverlay_$(date +%Y%m%d_%H%M%S)}"
-  LOG_FILE="${LOG_DIR}/${LOG_NAME}.log"
-  if [[ -e "${LOG_FILE}" ]]; then
-    echo "ERROR: log file already exists: ${LOG_FILE}" >&2
-    echo "  Use --name to disambiguate." >&2
-    exit 1
+  if [[ -n "${NAME}" ]]; then
+    LOG_NAME="${NAME}"
+    LOG_FILE="${LOG_DIR}/${LOG_NAME}.log"
+    if [[ -e "${LOG_FILE}" ]]; then
+      echo "ERROR: log file already exists: ${LOG_FILE}" >&2
+      echo "  Use --name to disambiguate." >&2
+      exit 1
+    fi
+  else
+    while true; do
+      LOG_NAME="superoverlay_$(date +%Y%m%d_%H%M%S)_$(tr -dc 'a-f0-9' < /dev/urandom | head -c 6)"
+      LOG_FILE="${LOG_DIR}/${LOG_NAME}.log"
+      [[ ! -e "${LOG_FILE}" ]] && break
+    done
   fi
   echo "Starting in background..."
   echo "  Log : ${LOG_FILE}"
@@ -112,9 +120,15 @@ if [[ -n "${ALGORITHM}" ]]; then
 fi
 [[ ${MULTIDIRECTIONAL} -eq 1 ]] && HS_MULTIDIRECTIONAL=1
 
-[[ -z "${NAME}" ]] && NAME="superoverlay_${TIMESTAMP}"
-
 KML_DIR="${LIDAR_DIR}/kml"
+
+if [[ -z "${NAME}" ]]; then
+  while true; do
+    NAME="superoverlay_$(date +%Y%m%d_%H%M%S)_$(tr -dc 'a-f0-9' < /dev/urandom | head -c 6)"
+    [[ ! -e "${KML_DIR}/${NAME}" ]] && break
+  done
+fi
+
 OUT_DIR="${KML_DIR}/${NAME}"
 
 if [[ -e "${OUT_DIR}" && ${DRY_RUN} -eq 0 ]]; then
