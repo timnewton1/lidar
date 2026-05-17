@@ -313,6 +313,16 @@ for SHADING in "${SHADINGS[@]}"; do
       -j ALL_CPUS \
       "${WGS84_TIF}" "${PROJ_OUT}"
 
+    # Inject <LookAt> so Google Earth focuses on the actual data instead
+    # of the union of world-spanning overview tile bounds.
+    if [[ -f "${PROJ_OUT}/doc.kml" ]]; then
+      read -r LK_LON LK_LAT LK_RANGE < <(compute_lookat "${WGS84_TIF}") || true
+      if [[ -n "${LK_LON:-}" ]]; then
+        inject_lookat "${PROJ_OUT}/doc.kml" "${LK_LON}" "${LK_LAT}" "${LK_RANGE}"
+        echo "  LookAt: ${LK_LON}, ${LK_LAT} @ ${LK_RANGE}m"
+      fi
+    fi
+
     rm -f "${SHADE_TIF}" "${WGS84_TIF}"
   done
 done
