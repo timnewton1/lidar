@@ -1,0 +1,58 @@
+# Templated systemd user unit for lidar_hillshade.sh.
+#
+# The instance name (the bit after the @) is passed to the script as --name,
+# and is also the per-instance config file under ~/.config/lidar/.
+#
+# Install (per user, one-time):
+#   loginctl enable-linger $USER
+#   mkdir -p ~/.config/systemd/user ~/.config/lidar
+#   ln -s /var/home/tim/scripts/gis/lidar/systemd/lidar-hillshade@.service \
+#         ~/.config/systemd/user/lidar-hillshade@.service
+#
+# Per-run setup:
+#   cat > ~/.config/lidar/myrun.env <<'EOF'
+#   GIS_DIR=/mnt/data/gis
+#   DOWNLOAD_LIST=https://prd-tnm.s3.amazonaws.com/.../0_file_download_links.txt
+#   EXTRA_ARGS=--shading hillshade,slopeshade
+#   EOF
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now lidar-hillshade@myrun
+#
+# Observe:
+#   systemctl --user status lidar-hillshade@myrun
+#   journalctl --user -u lidar-hillshade@myrun -f
+#
+# Stop:
+#   systemctl --user stop lidar-hillshade@myrun
+#
+# The script's own flock (per --name) plus StartLimitBurst here prevent
+# restart-loop thrashing if something is wedged.
+
+[Unit]
+Description=Lidar hillshade pipeline (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/scripts/gis/lidar
+EnvironmentFile=%h/.config/lidar/%i.env
+ExecStart=/bin/bash -c '%h/scripts/gis/lidar/lidar_hillshade.sh --name %i ${EXTRA_ARGS} "${DOWNLOAD_LIST}"'
+
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+# Minimum-viable hardening — anything stricter tends to break flatpak GDAL.
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lidar-%i
+TimeoutStartSec=infinity
+TimeoutStopSec=2min
+
+[Install]
+WantedBy=default.target

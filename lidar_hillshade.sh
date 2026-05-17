@@ -145,6 +145,21 @@ fi
 
 [[ -z "${NAME}" ]] && NAME="superoverlay_${TIMESTAMP}"
 
+# ─── Single-instance lock (per --name) ───────────────────────────────────────
+# Prevents accidental dual-runs of the same NAME. Exits 0 (clean) when the
+# lock is held so systemd Restart=on-failure doesn't loop on it. Lock is
+# released automatically when the process exits.
+LOCK_DIR="${LIDAR_DIR}/locks"
+mkdir -p "${LOCK_DIR}"
+LOCK_FILE="${LOCK_DIR}/${NAME}.lock"
+exec {LOCK_FD}>"${LOCK_FILE}"
+if ! flock -n "${LOCK_FD}"; then
+  HOLDER=$(cat "${LOCK_FILE}" 2>/dev/null || true)
+  echo "Another instance is already running (lock ${LOCK_FILE}${HOLDER:+, PID ${HOLDER}})"
+  exit 0
+fi
+echo $$ > "${LOCK_FILE}"
+
 KML_DIR="${LIDAR_DIR}/kml"
 OUT_DIR="${KML_DIR}/${NAME}"
 
