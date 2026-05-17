@@ -95,6 +95,49 @@ compute_max_zoom() {
   }'
 }
 
+# compute_lookat: emit "lon lat range" for a KML <LookAt> centered on the
+# raster, with the camera range sized so the data ~fills the view. Needed
+# because forcing --min-zoom=0 makes the lowest pyramid tile span the world,
+# and Google Earth's "fly to" picks the union of contained features' bboxes
+# — which becomes Earth's centroid instead of the actual data center.
+# <LookAt> on the root Document overrides that camera calculation.
+# Usage: read lon lat range < <(compute_lookat path/to/wgs84.tif)
+compute_lookat() {
+  local tif="$1" info
+  info=$("${GDALINFO[@]}" "${tif}" 2>/dev/null) || return 1
+  local cx cy ulx uly lrx lry
+  cx=$(echo "${info}" | { grep -oP '^Center\s*\(\s*\K-?[0-9.]+'                          || true; })
+  cy=$(echo "${info}" | { grep -oP '^Center\s*\(\s*-?[0-9.]+,\s*\K-?[0-9.]+'             || true; })
+  ulx=$(echo "${info}" | { grep -oP '^Upper Left\s*\(\s*\K-?[0-9.]+'                     || true; })
+  uly=$(echo "${info}" | { grep -oP '^Upper Left\s*\(\s*-?[0-9.]+,\s*\K-?[0-9.]+'        || true; })
+  lrx=$(echo "${info}" | { grep -oP '^Lower Right\s*\(\s*\K-?[0-9.]+'                    || true; })
+  lry=$(echo "${info}" | { grep -oP '^Lower Right\s*\(\s*-?[0-9.]+,\s*\K-?[0-9.]+'       || true; })
+  [[ -n "${cx}" && -n "${cy}" && -n "${ulx}" && -n "${uly}" && -n "${lrx}" && -n "${lry}" ]] \
+    || { echo "ERROR: could not parse corner coords from ${tif}" >&2; return 1; }
+  awk -v cx="${cx}" -v cy="${cy}" \
+      -v ulx="${ulx}" -v uly="${uly}" -v lrx="${lrx}" -v lry="${lry}" 'BEGIN {
+    w = lrx - ulx; if (w < 0) w = -w
+    h = uly - lry; if (h < 0) h = -h
+    ext_deg = (w > h ? w : h)
+    # ~111 km per degree of latitude; pad 1.5x so the data does not fill
+    # edge-to-edge. Floor at 5 km so tiny datasets are not absurdly close.
+    range = ext_deg * 111000 * 1.5
+    if (range < 5000) range = 5000
+    printf "%s %s %d\n", cx, cy, range
+  }'
+}
+
+# Inject a <LookAt> element into a KML Document so Google Earth focuses on
+# the data (not on the geographic union of world-spanning overview tiles).
+# Args: <doc_kml_path> <lon> <lat> <range_m>
+inject_lookat() {
+  local kml="$1" lon="$2" lat="$3" range="$4"
+  local lookat="<LookAt><longitude>${lon}</longitude><latitude>${lat}</latitude><altitude>0</altitude><range>${range}</range><tilt>0</tilt><heading>0</heading><altitudeMode>relativeToGround</altitudeMode></LookAt>"
+  # Replace the FIRST <Document> open tag only. 0,/pat/{} confines the
+  # substitution to the range up to and including the first match.
+  sed -i "0,/<Document>/{s|<Document>|<Document>${lookat}|}" "${kml}"
+}
+
 # ─── Reproject helper ────────────────────────────────────────────────────────
 # -srcnodata 0: gdaldem writes 0 for nodata pixels (single-band byte).
 # -dstalpha: bilinear can blend nodata=0 into real pixels near edges, leaving
