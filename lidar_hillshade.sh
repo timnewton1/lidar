@@ -12,6 +12,9 @@
 #                        Default: superoverlay_TIMESTAMP
 #   --gis-dir PATH       override GIS_DIR for this run
 #   --kmz                also package the pyramid into a portable .kmz file
+#   --background         detach and run in the background; log to
+#                        $GIS_DIR/lidar/logs/<name>.log. Prints PID + log path.
+#   --list-running       list active background runs (PID, log path) and exit
 #   -h, --help           show this help
 #
 # Output: $GIS_DIR/lidar/kml/<name>/doc.kml
@@ -22,7 +25,7 @@
 set -euo pipefail
 
 usage() {
-  sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-1}"
 }
 
@@ -33,6 +36,10 @@ GIS_DIR_OVERRIDE=""
 DOWNLOAD_LIST=""
 ALGORITHM=""
 MULTIDIRECTIONAL=0
+BACKGROUND=0
+LIST_RUNNING=0
+
+ORIG_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -42,6 +49,8 @@ while [[ $# -gt 0 ]]; do
     --name)             NAME="$2"; shift 2 ;;
     --gis-dir)          GIS_DIR_OVERRIDE="$2"; shift 2 ;;
     --kmz)              PACKAGE_KMZ=1; shift ;;
+    --background)       BACKGROUND=1; shift ;;
+    --list-running)     LIST_RUNNING=1; shift ;;
     -h|--help)          usage 0 ;;
     -*)                 echo "Unknown flag: $1" >&2; usage ;;
     *)
@@ -49,7 +58,65 @@ while [[ $# -gt 0 ]]; do
       DOWNLOAD_LIST="$1"; shift ;;
   esac
 done
+
+# ─── --list-running: scan PID sidecars and exit ──────────────────────────────
+if [[ ${LIST_RUNNING} -eq 1 ]]; then
+  EFFECTIVE_GIS_DIR="${GIS_DIR_OVERRIDE:-${GIS_DIR:-}}"
+  [[ -z "${EFFECTIVE_GIS_DIR}" ]] && { echo "ERROR: GIS_DIR not set" >&2; exit 1; }
+  LOG_DIR="${EFFECTIVE_GIS_DIR}/lidar/logs"
+  if [[ ! -d "${LOG_DIR}" ]]; then
+    echo "No background runs (no ${LOG_DIR})"
+    exit 0
+  fi
+  shopt -s nullglob
+  COUNT=0
+  printf "%-8s  %-19s  %s\n" "PID" "STARTED" "LOG"
+  for pidfile in "${LOG_DIR}"/*.log.pid; do
+    pid=$(cat "${pidfile}" 2>/dev/null || true)
+    [[ -z "${pid}" ]] && continue
+    if kill -0 "${pid}" 2>/dev/null; then
+      started=$(stat -c %y "${pidfile}" 2>/dev/null | cut -d. -f1)
+      printf "%-8s  %-19s  %s\n" "${pid}" "${started}" "${pidfile%.pid}"
+      COUNT=$((COUNT + 1))
+    else
+      rm -f "${pidfile}"
+    fi
+  done
+  [[ ${COUNT} -eq 0 ]] && echo "(none)"
+  exit 0
+fi
+
 [[ -z "${DOWNLOAD_LIST}" ]] && usage
+
+# ─── --background: re-exec detached, log to file, print PID, exit ────────────
+if [[ ${BACKGROUND} -eq 1 ]]; then
+  # Strip --background from forwarded args so the child doesn't recurse.
+  CHILD_ARGS=()
+  for a in "${ORIG_ARGS[@]}"; do
+    [[ "${a}" == "--background" ]] && continue
+    CHILD_ARGS+=("${a}")
+  done
+  # Resolve GIS_DIR the same way the child will, just for the log path.
+  EFFECTIVE_GIS_DIR="${GIS_DIR_OVERRIDE:-${GIS_DIR:-}}"
+  [[ -z "${EFFECTIVE_GIS_DIR}" ]] && { echo "ERROR: GIS_DIR not set" >&2; exit 1; }
+  LOG_DIR="${EFFECTIVE_GIS_DIR}/lidar/logs"
+  mkdir -p "${LOG_DIR}"
+  LOG_NAME="${NAME:-superoverlay_$(date +%Y%m%d_%H%M%S)}"
+  LOG_FILE="${LOG_DIR}/${LOG_NAME}.log"
+  if [[ -e "${LOG_FILE}" ]]; then
+    echo "ERROR: log file already exists: ${LOG_FILE}" >&2
+    echo "  Use --name to disambiguate." >&2
+    exit 1
+  fi
+  echo "Starting in background..."
+  echo "  Log : ${LOG_FILE}"
+  nohup "${BASH_SOURCE[0]}" "${CHILD_ARGS[@]}" >"${LOG_FILE}" 2>&1 </dev/null &
+  CHILD_PID=$!
+  echo "${CHILD_PID}" > "${LOG_FILE}.pid"
+  echo "  PID : ${CHILD_PID}"
+  disown
+  exit 0
+fi
 
 [[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
 

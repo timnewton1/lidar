@@ -108,8 +108,11 @@ check_deps_and_input() {
   fi
 
   # Accept either a local path or an http(s):// URL to a .txt of tile URLs.
+  # Fetched lists land in WORK_DIR (per-run) to avoid collisions between
+  # concurrent background runs sharing the same URL basename.
   if [[ "${download_list}" =~ ^https?:// ]]; then
-    local fetched="${LIDAR_DIR}/${download_list##*/}"
+    [[ -n "${WORK_DIR:-}" ]] || { echo "ERROR: WORK_DIR not set"; exit 1; }
+    local fetched="${WORK_DIR}/${download_list##*/}"
     echo "  Fetching link list: ${download_list}"
     curl -L --retry 5 --retry-all-errors --fail-with-body --max-time 120 \
       -o "${fetched}.partial" "${download_list}" \
@@ -122,7 +125,10 @@ check_deps_and_input() {
   fi
 
   DOWNLOAD_LIST="${download_list}"
-  FILTERED_LIST="${LIDAR_DIR}/filtered_tiles.txt"
+  # Per-run filtered list under WORK_DIR — two concurrent runs would otherwise
+  # clobber each other on this file mid-iteration.
+  [[ -n "${WORK_DIR:-}" ]] || { echo "ERROR: WORK_DIR not set"; exit 1; }
+  FILTERED_LIST="${WORK_DIR}/filtered_tiles.txt"
   grep -i '\.tif' "${DOWNLOAD_LIST}" | grep -v '^#' | grep -v '^[[:space:]]*$' > "${FILTERED_LIST}" || true
 
   TOTAL_TILES=$(wc -l < "${FILTERED_LIST}")
@@ -269,20 +275,28 @@ download_tiles() {
       "${PROCESSED}" "${TOTAL_TILES}" "${PCT}" "${BASENAME}" \
       "$(human_bytes "${BYTES_DOWNLOADED}")" "$(human_bytes "${BYTES_TOTAL_EST}")" \
       "${ETA_STR}"
-    # Atomic write: stream into .partial, rename on success. -C - resumes a
-    # truncated .partial from a prior run instead of restarting from byte 0.
-    local PARTIAL="${TILE_TIF}.partial"
+    # PID-suffixed partial so concurrent background runs covering the same
+    # tile don't clobber each other's writes. Cross-run resume is sacrificed,
+    # but resume within a single run still works (-C -). If another run wins
+    # the race and the final file appears, drop our partial.
+    local PARTIAL="${TILE_TIF}.$$.partial"
     local T0=${SECONDS}
     if ! curl -L --retry 5 --retry-all-errors --retry-delay 5 \
               --fail-with-body --max-time 1800 -C - -# \
               -o "${PARTIAL}" "${URL}"; then
       echo "  ERROR: download failed for ${URL}" >&2
       ERRORS=$((ERRORS + 1))
+      rm -f "${PARTIAL}"
       continue
     fi
     local TILE_ELAPSED=$(( SECONDS - T0 ))
     (( TILE_ELAPSED < 1 )) && TILE_ELAPSED=1
-    mv -f "${PARTIAL}" "${TILE_TIF}"
+    if [[ -f "${TILE_TIF}" ]]; then
+      # Another concurrent run finished this tile while we were downloading.
+      rm -f "${PARTIAL}"
+    else
+      mv -f "${PARTIAL}" "${TILE_TIF}"
+    fi
     local TILE_SIZE
     TILE_SIZE=$(stat -c %s "${TILE_TIF}")
     BYTES_DOWNLOADED=$((BYTES_DOWNLOADED + TILE_SIZE))
