@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# `lidar log` — stream or page a run's log file.
+#
+# Usage: lidar log [options] <name|hex>
+#
+# Follows live output for running jobs (tail -f); pages completed logs
+# with less (or cat when stdout is not a TTY).
+#
+# Options:
+#   -n, --lines N    show last N lines before following / paging (default: all)
+#   --gis-dir PATH   override GIS_DIR
+#   -h, --help       show this help
+
+source "${LIDAR_HOME}/lib/strict.sh"
+
+usage() { sed -n '3,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+
+LINES=""
+GIS_DIR_OVERRIDE=""
+TARGET=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--lines)   LINES="$2"; shift 2 ;;
+    --gis-dir)    GIS_DIR_OVERRIDE="$2"; shift 2 ;;
+    -h|--help)    usage 0 ;;
+    -*)           echo "Unknown flag: $1" >&2; usage ;;
+    *)            [[ -n "${TARGET}" ]] && { echo "Too many arguments" >&2; usage; }
+                  TARGET="$1"; shift ;;
+  esac
+done
+
+[[ -z "${TARGET}" ]] && usage
+
+[[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
+source "${LIDAR_HOME}/lib/common.sh"
+source "${LIDAR_HOME}/lib/events.sh"
+
+RUN_ID=$(resolve_run_id "${TARGET}") || exit 1
+
+# Look up log path and PID from events.
+ROW=$(jq -rs --arg id "${RUN_ID}" '
+  [ .[] | select(.id == $id) ] |
+  {
+    log:  (map(select(.event=="start")) | last | .log),
+    pid:  (map(select(.event=="start")) | last | .pid),
+    done: (map(select(.event=="end"))   | length > 0)
+  }
+' "${EVENTS_FILE}")
+
+LOG_PATH=$(echo "${ROW}" | jq -r '.log')
+PID=$(echo "${ROW}" | jq -r '.pid')
+DONE=$(echo "${ROW}" | jq -r '.done')
+
+if [[ -z "${LOG_PATH}" || "${LOG_PATH}" == "null" || ! -f "${LOG_PATH}" ]]; then
+  # Fall back to the canonical path — valid for runs where name == log filename.
+  FALLBACK="${LIDAR_DIR}/logs/${RUN_ID}.log"
+  if [[ -f "${FALLBACK}" ]]; then
+    LOG_PATH="${FALLBACK}"
+  else
+    echo "ERROR: log file not found for '${RUN_ID}'" >&2
+    echo "  Tried: ${LOG_PATH}" >&2
+    echo "  Tried: ${FALLBACK}" >&2
+    exit 1
+  fi
+fi
+
+RUNNING=0
+if [[ "${DONE}" == "false" && -n "${PID}" && "${PID}" != "null" ]]; then
+  kill -0 "${PID}" 2>/dev/null && RUNNING=1 || true
+fi
+
+if [[ ${RUNNING} -eq 1 ]]; then
+  TAIL_ARGS=(-f)
+  [[ -n "${LINES}" ]] && TAIL_ARGS=(-n "${LINES}" -f)
+  exec tail "${TAIL_ARGS[@]}" "${LOG_PATH}"
+else
+  if [[ -t 1 ]]; then
+    LESS_ARGS=(+G)  # start at end
+    [[ -n "${LINES}" ]] && LESS_ARGS=(+"$(( $(wc -l < "${LOG_PATH}") - LINES + 1 ))g")
+    exec less "${LESS_ARGS[@]}" "${LOG_PATH}"
+  else
+    if [[ -n "${LINES}" ]]; then
+      exec tail -n "${LINES}" "${LOG_PATH}"
+    else
+      exec cat "${LOG_PATH}"
+    fi
+  fi
+fi

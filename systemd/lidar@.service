@@ -1,0 +1,50 @@
+# Templated systemd user unit for the lidar pipeline.
+#
+# Install:  lidar service install <name> [opts...] <URL>
+# Stop:     lidar service uninstall <name>
+# Status:   systemctl --user status lidar@<name>
+# Logs:     journalctl --user -u lidar@<name> -f
+
+[Unit]
+Description=Lidar pipeline (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/scripts/gis/lidar
+EnvironmentFile=%h/.config/lidar/%i.env
+ExecStart=/bin/bash -c '%h/scripts/gis/lidar/lidar run --name %i ${EXTRA_ARGS} "${DOWNLOAD_LIST}"'
+
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+# Hardening compatible with flatpak GDAL (org.qgis.qgis):
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=tmpfs
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+LockPersonality=yes
+PrivateDevices=yes
+SystemCallArchitectures=native
+SystemCallFilter=~@clock @debug @module @obsolete @privileged @raw-io @reboot @swap
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Intentionally omitted — break flatpak bwrap or GDAL JIT codecs:
+#   RestrictNamespaces=     (flatpak requires user namespace creation via bwrap)
+#   MemoryDenyWriteExecute= (GDAL DEFLATE/LZW JIT codegen segfaults)
+#   ProtectSystem=strict    (flatpak ExecStart cannot reach its /tmp sandbox)
+# ReadWritePaths is added per-install via a drop-in (see lidar service install).
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lidar-%i
+TimeoutStartSec=infinity
+TimeoutStopSec=2min
+
+[Install]
+WantedBy=default.target
