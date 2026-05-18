@@ -39,48 +39,61 @@ setup() {
   [[ "${output}" == *"Horn or ZevenbergenThorne"* ]]
 }
 
+@test "lidar run --output with unknown token rejected" {
+  run "${LIDAR}" run --output xml "${FIXTURES}/one_tile.txt"
+  [ "${status}" -ne 0 ]
+  [[ "${output}" == *"--output unknown"* ]]
+}
+
 @test "lidar run --cog-crs with bad value errors before deps check" {
-  run "${LIDAR}" run --cog --cog-crs FOO "${FIXTURES}/one_tile.txt"
+  run "${LIDAR}" run --output cog --cog-crs FOO "${FIXTURES}/one_tile.txt"
   [ "${status}" -ne 0 ]
   [[ "${output}" == *"--cog-crs must match"* ]]
 }
 
-@test "lidar run --cog-crs without --cog rejected" {
-  run "${LIDAR}" run --cog-crs EPSG:32614 "${FIXTURES}/one_tile.txt"
+@test "lidar run --cog-crs without cog in --output rejected" {
+  run "${LIDAR}" run --output kml --cog-crs EPSG:32614 "${FIXTURES}/one_tile.txt"
   [ "${status}" -ne 0 ]
-  [[ "${output}" == *"require --cog"* ]]
+  [[ "${output}" == *"require --output to include cog"* ]]
 }
 
-@test "lidar run --cog-no-reproject without --cog rejected" {
-  run "${LIDAR}" run --cog-no-reproject "${FIXTURES}/one_tile.txt"
+@test "lidar run --cog-no-reproject without cog in --output rejected" {
+  run "${LIDAR}" run --output kml --cog-no-reproject "${FIXTURES}/one_tile.txt"
   [ "${status}" -ne 0 ]
-  [[ "${output}" == *"require --cog"* ]]
+  [[ "${output}" == *"require --output to include cog"* ]]
 }
 
 @test "lidar run --cog-crs and --cog-no-reproject are mutually exclusive" {
-  run "${LIDAR}" run --cog --cog-crs EPSG:32614 --cog-no-reproject "${FIXTURES}/one_tile.txt"
+  run "${LIDAR}" run --output cog --cog-crs EPSG:32614 --cog-no-reproject "${FIXTURES}/one_tile.txt"
   [ "${status}" -ne 0 ]
   [[ "${output}" == *"mutually exclusive"* ]]
 }
 
-@test "lidar run --cog-crs EPSG:32614 accepted (validation passes)" {
+@test "lidar run --output cog --cog-crs EPSG:32614 accepted (validation passes)" {
   # Validation happens before deps; the run will fail later on flatpak/inputs,
   # but the EPSG check itself must pass — i.e. no "--cog-crs must match" error.
-  run bash -c "\"${LIDAR}\" run --cog --cog-crs EPSG:32614 \"${FIXTURES}/one_tile.txt\" 2>&1 || true"
+  run bash -c "\"${LIDAR}\" run --output cog --cog-crs EPSG:32614 \"${FIXTURES}/one_tile.txt\" 2>&1 || true"
   [[ "${output}" != *"--cog-crs must match"* ]]
   [[ "${output}" != *"mutually exclusive"* ]]
 }
 
-@test "lidar run -c is equivalent to --cog (flag parses)" {
-  run bash -c "\"${LIDAR}\" run -c --cog-crs FOO \"${FIXTURES}/one_tile.txt\" 2>&1 || true"
-  # -c must trigger PACKAGE_COG=1 so --cog-crs FOO reaches the EPSG validator.
+@test "lidar run -o is equivalent to --output (flag parses)" {
+  run bash -c "\"${LIDAR}\" run -o cog --cog-crs FOO \"${FIXTURES}/one_tile.txt\" 2>&1 || true"
+  # -o must trigger OUTPUT_COG=1 so --cog-crs FOO reaches the EPSG validator.
   [[ "${output}" == *"--cog-crs must match"* ]]
 }
 
-@test "lidar run usage includes --cog options" {
+@test "lidar run --output kml,cog accepted" {
+  run bash -c "\"${LIDAR}\" run --output kml,cog \"${FIXTURES}/one_tile.txt\" 2>&1 || true"
+  # Should not fail at flag parsing; downstream errors are fine.
+  [[ "${output}" != *"--output unknown"* ]]
+  [[ "${output}" != *"empty token"* ]]
+}
+
+@test "lidar run usage includes --output and cog modifiers" {
   run "${LIDAR}" run --help
   [ "${status}" -eq 0 ]
-  [[ "${output}" == *"--cog"* ]]
+  [[ "${output}" == *"--output"* ]]
   [[ "${output}" == *"--cog-crs"* ]]
   [[ "${output}" == *"--cog-no-reproject"* ]]
 }

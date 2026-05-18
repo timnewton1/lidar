@@ -34,16 +34,32 @@ The directory sits parallel to `${LIDAR_DIR}/kml/` and `${LIDAR_DIR}/kmz/`.
 
 ## CLI
 
-New flags on `lidar run`:
+Output selection is a CSV via `--output`, replacing the previous boolean
+`--kmz` / `--cog` flags. Default is `kml` (preserves prior behavior for
+existing scripts that pass no output flags).
 
 | Flag | Effect |
 |------|--------|
-| `-c`, `--cog` | Produce COG output alongside KML |
-| `--cog-crs EPSG:NNNN` | Reproject to this CRS (must match `^EPSG:[0-9]+$`) |
-| `--cog-no-reproject` | Force native CRS even if geographic (with stderr warning) |
+| `-o`, `--output OUTPUTS` | Comma-separated outputs. Known: `kml`, `kmz`, `cog`. Default: `kml`. |
+| `--cog-crs EPSG:NNNN` | Reproject COG output to this CRS (must match `^EPSG:[0-9]+$`) |
+| `--cog-no-reproject` | Force native CRS for COG output even if geographic (with stderr warning) |
 
-`--cog-crs` and `--cog-no-reproject` require `--cog` and are mutually
-exclusive. Validation runs before any heavy lifting.
+Output semantics:
+
+- `kml` — Google Earth super-overlay tile pyramid (the expensive step)
+- `kmz` — kml + zipped `.kmz` (auto-enables kml; you cannot zip a pyramid that wasn't built)
+- `cog` — Cloud-Optimized GeoTIFFs into `${LIDAR_DIR}/cog/${NAME}/`
+
+`--output cog` (without `kml`) is dramatically faster — skips the WGS84
+reproject (Step 6b) and the `gdal raster tile` pyramid build (Step 6c),
+which together dominate post-download wall time at high zoom levels.
+
+Validation (runs before any heavy lifting):
+- Each token must be in `{kml, kmz, cog}` (case-insensitive)
+- Empty tokens rejected
+- `--cog-crs` matches `^EPSG:[0-9]+$` if provided
+- `--cog-crs` and `--cog-no-reproject` require `cog` in `--output`
+- `--cog-crs` and `--cog-no-reproject` mutually exclusive
 
 ### CRS resolution
 
