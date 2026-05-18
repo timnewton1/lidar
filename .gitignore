@@ -1,1 +1,19 @@
-lidar.log
+# Logs
+*.log
+
+# Local scratch / runtime
+*.tmp
+*.swp
+*.swo
+.work_*/
+
+# Editor / OS junk
+.DS_Store
+Thumbs.db
+*~
+.vscode/
+.idea/
+
+# Python (bats helpers / WKT parsing)
+__pycache__/
+*.pyc
