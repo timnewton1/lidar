@@ -17,3 +17,6 @@ Thumbs.db
 # Python (bats helpers / WKT parsing)
 __pycache__/
 *.pyc
+
+# Git worktrees
+.worktrees/
