@@ -7,7 +7,7 @@ Subcommands:
   list                   List runs from the events index
   log  <name|hex>        Stream (running) or page (done) a run's log file
   size <name|hex>        Show disk usage for a run's output files
-  kill                   Stop a running pipeline (by PID, or --all)
+  kill <name|hex|PID>    Stop a running pipeline (or --all)
   service install N      Install systemd --user service named N
   service uninstall N    Stop, disable, and remove service N
   help                   Show this help
