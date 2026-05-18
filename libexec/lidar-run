@@ -14,6 +14,13 @@
 #                            Default: superoverlay_TIMESTAMP
 #   -g, --gis-dir PATH       override GIS_DIR for this run
 #   -k, --kmz                also package the pyramid into a portable .kmz file
+#   -c, --cog                also produce Cloud-Optimized GeoTIFFs (DEM +
+#                            shade rasters) into GIS_DIR/lidar/cog/<name>/ —
+#                            drop-in for QGIS / ArcGIS / any GeoTIFF reader.
+#       --cog-crs EPSG:NNNN  reproject COG output to this CRS (default: source
+#                            CRS if projected, else auto-pick UTM zone)
+#       --cog-no-reproject   keep source CRS even if geographic (warns; QGIS
+#                            3D Map View may not render geographic CRSes)
 #   -b, --background         detach and run in the background; log to
 #                            GIS_DIR/lidar/logs/<name>.log. Prints PID + log path.
 #   -d, --dry-run            validate inputs and print resolved plan; exit 0
@@ -22,13 +29,16 @@
 source "${LIDAR_HOME}/lib/strict.sh"
 
 usage() {
-  sed -n '3,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '3,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-1}"
 }
 
 SHADINGS_CSV="hillshade"
 NAME=""
 PACKAGE_KMZ=0
+PACKAGE_COG=0
+COG_CRS=""
+COG_NO_REPROJECT=0
 GIS_DIR_OVERRIDE=""
 DOWNLOAD_LIST=""
 ALGORITHM=""
@@ -45,6 +55,9 @@ while [[ $# -gt 0 ]]; do
     -n|--name)            NAME="$2"; shift 2 ;;
     -g|--gis-dir)         GIS_DIR_OVERRIDE="$2"; shift 2 ;;
     -k|--kmz)             PACKAGE_KMZ=1; shift ;;
+    -c|--cog)             PACKAGE_COG=1; shift ;;
+    --cog-crs)            COG_CRS="$2"; shift 2 ;;
+    --cog-no-reproject)   COG_NO_REPROJECT=1; shift ;;
     -b|--background)      BACKGROUND=1; shift ;;
     -d|--dry-run)         DRY_RUN=1; shift ;;
     -h|--help)            usage 0 ;;
@@ -55,6 +68,22 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# ─── Validate COG flags ──────────────────────────────────────────────────────
+if [[ -n "${COG_CRS}" ]]; then
+  [[ "${COG_CRS}" =~ ^EPSG:[0-9]+$ ]] || {
+    echo "ERROR: --cog-crs must match 'EPSG:NNNN' (got: ${COG_CRS})" >&2
+    exit 1
+  }
+fi
+if [[ -n "${COG_CRS}" || ${COG_NO_REPROJECT} -eq 1 ]] && [[ ${PACKAGE_COG} -eq 0 ]]; then
+  echo "ERROR: --cog-crs / --cog-no-reproject require --cog" >&2
+  exit 1
+fi
+if [[ -n "${COG_CRS}" && ${COG_NO_REPROJECT} -eq 1 ]]; then
+  echo "ERROR: --cog-crs and --cog-no-reproject are mutually exclusive" >&2
+  exit 1
+fi
+
 [[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
 
 source "${LIDAR_HOME}/lib/common.sh"
@@ -62,6 +91,7 @@ source "${LIDAR_HOME}/lib/events.sh"
 source "${LIDAR_HOME}/lib/download.sh"
 source "${LIDAR_HOME}/lib/gdal.sh"
 source "${LIDAR_HOME}/lib/kml.sh"
+source "${LIDAR_HOME}/lib/cog.sh"
 
 [[ -z "${DOWNLOAD_LIST}" ]] && usage
 
@@ -132,9 +162,15 @@ if [[ -z "${NAME}" ]]; then
 fi
 
 OUT_DIR="${KML_DIR}/${NAME}"
+COG_DIR="${LIDAR_DIR}/cog/${NAME}"
 
 if [[ -e "${OUT_DIR}" && ${DRY_RUN} -eq 0 ]]; then
   echo "ERROR: output directory already exists: ${OUT_DIR}" >&2
+  echo "  Choose a different --name or remove the existing directory." >&2
+  exit 1
+fi
+if [[ ${PACKAGE_COG} -eq 1 && -e "${COG_DIR}" && ${DRY_RUN} -eq 0 ]]; then
+  echo "ERROR: COG output directory already exists: ${COG_DIR}" >&2
   echo "  Choose a different --name or remove the existing directory." >&2
   exit 1
 fi
@@ -145,7 +181,17 @@ if [[ ${DRY_RUN} -eq 1 ]]; then
   trap 'rm -rf "${WORK_DIR}"' EXIT
   extra_deps=()
   [[ ${PACKAGE_KMZ} -eq 1 ]] && extra_deps+=(zip)
+  [[ ${PACKAGE_COG} -eq 1 ]] && extra_deps+=(python3)
   check_deps_and_input "${DOWNLOAD_LIST}" "${extra_deps[@]+"${extra_deps[@]}"}"
+  if [[ ${PACKAGE_COG} -eq 1 ]]; then
+    if [[ -n "${COG_CRS}" ]]; then
+      COG_CRS_PLAN="${COG_CRS} (explicit)"
+    elif [[ ${COG_NO_REPROJECT} -eq 1 ]]; then
+      COG_CRS_PLAN="native (no-reproject)"
+    else
+      COG_CRS_PLAN="auto (source CRS if projected; else UTM)"
+    fi
+  fi
   echo "=== DRY RUN PLAN ==="
   echo "Name        : ${NAME}"
   echo "Shadings    : ${SHADINGS[*]}"
@@ -154,6 +200,11 @@ if [[ ${DRY_RUN} -eq 1 ]]; then
   echo "Tile list   : ${DOWNLOAD_LIST}"
   echo "Tile count  : ${TOTAL_TILES}"
   echo "Package KMZ : ${PACKAGE_KMZ}"
+  echo "Package COG : ${PACKAGE_COG}"
+  if [[ ${PACKAGE_COG} -eq 1 ]]; then
+    echo "COG dir     : ${COG_DIR}"
+    echo "COG CRS     : ${COG_CRS_PLAN}"
+  fi
   echo "GIS_DIR     : ${GIS_DIR}"
   exit 0
 fi
@@ -199,6 +250,7 @@ cleanup_old_logs 30
 
 extra_deps=()
 [[ ${PACKAGE_KMZ} -eq 1 ]] && extra_deps+=(zip)
+[[ ${PACKAGE_COG} -eq 1 ]] && extra_deps+=(python3)
 
 check_deps_and_input "${DOWNLOAD_LIST}" "${extra_deps[@]+"${extra_deps[@]}"}"
 LISTS_DIR="${WORK_DIR}/project_lists"
@@ -324,18 +376,57 @@ for SHADING in "${SHADINGS[@]}"; do
       ensure_root_networklink "${PROJ_OUT}/doc.kml" "${PROJ_OUT}"
     fi
 
-    rm -f "${SHADE_TIF}" "${WGS84_TIF}"
+    rm -f "${WGS84_TIF}"
+    # SHADE_TIF (native CRS) is the COG source for Step 7. Keep it in
+    # WORK_DIR when --cog is set; EXIT trap cleans the dir at end of run.
+    [[ ${PACKAGE_COG} -eq 1 ]] || rm -f "${SHADE_TIF}"
   done
 done
 
-# ─── Step 7: Optional KMZ packaging (one .kmz per super-overlay) ─────────────
+# ─── Step 7: Optional COG output (one DEM per project + one shade per pair) ──
+# Produces self-contained Cloud-Optimized GeoTIFFs in COG_DIR. CRS resolved
+# per project (cached on first call so the shade builders reuse the result).
+COG_PATHS=()
+if [[ ${PACKAGE_COG} -eq 1 ]]; then
+  echo "=========================================="
+  echo "STEP 7: Packaging COG (DEM + shadings)"
+  echo "=========================================="
+  mkdir -p "${COG_DIR}"
+  declare -A PROJECT_COG_CRS=()
+  COG_CRS_SUMMARY=""
+
+  for PROJECT in "${PROJECT_NAMES[@]}"; do
+    TARGET_CRS=$(cog_resolve_crs "${DEM_VRT[${PROJECT}]}")
+    PROJECT_COG_CRS["${PROJECT}"]="${TARGET_CRS}"
+    DEM_OUT="${COG_DIR}/${PROJECT}_dem.tif"
+    echo "  ${PROJECT}/dem → ${TARGET_CRS}"
+    build_cog_dem "${DEM_VRT[${PROJECT}]}" "${DEM_OUT}" "${TARGET_CRS}"
+    COG_PATHS+=("${DEM_OUT}")
+    COG_CRS_SUMMARY+="${PROJECT}=${TARGET_CRS} "
+  done
+
+  for SHADING in "${SHADINGS[@]}"; do
+    for PROJECT in "${PROJECT_NAMES[@]}"; do
+      SHADE_TIF="${WORK_DIR}/${SHADING}_${PROJECT}.tif"
+      SHADE_OUT="${COG_DIR}/${SHADING}__${PROJECT}.tif"
+      TARGET_CRS="${PROJECT_COG_CRS[${PROJECT}]}"
+      echo "  ${SHADING}/${PROJECT} → ${TARGET_CRS}"
+      build_cog_shade "${SHADE_TIF}" "${SHADE_OUT}" "${TARGET_CRS}"
+      COG_PATHS+=("${SHADE_OUT}")
+    done
+  done
+
+  write_cog_readme "${COG_DIR}" "${COG_CRS_SUMMARY% }"
+fi
+
+# ─── Step 8: Optional KMZ packaging (one .kmz per super-overlay) ─────────────
 # A KMZ archive expects exactly one doc.kml at its root. Each (shading,
 # project) super-overlay is independently complete, so we ship one KMZ
 # per super-overlay rather than zipping the whole tree.
 KMZ_PATHS=()
 if [[ ${PACKAGE_KMZ} -eq 1 ]]; then
   echo "=========================================="
-  echo "STEP 7: Packaging KMZ (one per super-overlay)"
+  echo "STEP 8: Packaging KMZ (one per super-overlay)"
   echo "=========================================="
   KMZ_DIR="${LIDAR_DIR}/kmz/${NAME}"
   mkdir -p "${KMZ_DIR}"
@@ -365,5 +456,11 @@ if [[ ${#KMZ_PATHS[@]} -gt 0 ]]; then
   echo ""
   echo "Portable KMZ files:"
   for k in "${KMZ_PATHS[@]}"; do echo "  ${k}"; done
+fi
+if [[ ${#COG_PATHS[@]} -gt 0 ]]; then
+  echo ""
+  echo "COG output (drop into QGIS / ArcGIS / any GeoTIFF reader):"
+  echo "  ${COG_DIR}/  ($(du -sh "${COG_DIR}" | cut -f1))"
+  echo "  README       : ${COG_DIR}/README.md"
 fi
 echo "=========================================="
