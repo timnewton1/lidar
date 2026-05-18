@@ -1,34 +1,46 @@
 #!/usr/bin/env bash
-# `lidar run` — download USGS lidar tiles and generate KML tile pyramids.
+# `lidar run` — download USGS lidar tiles and produce KML/KMZ/COG outputs.
 #
 # Usage: lidar run [options] <downloadlist.txt|URL>
 #
 # Options:
-#   --shading LIST       comma-separated shadings (default: hillshade)
-#                        Known: hillshade, slopeshade
-#   --algorithm ALG      hillshade algorithm: Horn (default) | ZevenbergenThorne
-#                        Horn is the safer default for noisy lidar DEMs.
-#   --multidirectional   use gdaldem -multidirectional (USGS's choice);
-#                        otherwise -combined with az=315 alt=45.
-#   --name NAME          output directory + root KML <name>
-#                        Default: superoverlay_TIMESTAMP
-#   --gis-dir PATH       override GIS_DIR for this run
-#   --kmz                also package the pyramid into a portable .kmz file
-#   --background         detach and run in the background; log to
-#                        GIS_DIR/lidar/logs/<name>.log. Prints PID + log path.
-#   --dry-run            validate inputs and print resolved plan; exit 0
-#   -h, --help           show this help
+#   -s, --shading LIST       comma-separated shadings (default: hillshade)
+#                            Known: hillshade, slopeshade
+#   -a, --algorithm ALG      hillshade algorithm: Horn (default) | ZevenbergenThorne
+#                            Horn is the safer default for noisy lidar DEMs.
+#   -m, --multidirectional   use gdaldem -multidirectional (USGS's choice);
+#                            otherwise -combined with az=315 alt=45.
+#   -n, --name NAME          output directory + root KML <name>
+#                            Default: superoverlay_TIMESTAMP
+#   -g, --gis-dir PATH       override GIS_DIR for this run
+#   -o, --output OUTPUTS     comma-separated outputs (default: kml).
+#                            Known: kml, kmz, cog.
+#                              kml — Google Earth super-overlay tile pyramid
+#                              kmz — kml + zipped .kmz (auto-enables kml)
+#                              cog — Cloud-Optimized GeoTIFFs into cog/<name>/
+#                            'cog' without 'kml' is dramatically faster —
+#                            skips the WGS84 reproject and tile pyramid steps.
+#       --cog-crs EPSG:NNNN  reproject COG output to this CRS (default: source
+#                            CRS if projected, else auto-pick UTM zone)
+#       --cog-no-reproject   keep source CRS even if geographic (warns; QGIS
+#                            3D Map View may not render geographic CRSes)
+#   -b, --background         detach and run in the background; log to
+#                            GIS_DIR/lidar/logs/<name>.log. Prints PID + log path.
+#   -d, --dry-run            validate inputs and print resolved plan; exit 0
+#   -h, --help               show this help
 
 source "${LIDAR_HOME}/lib/strict.sh"
 
 usage() {
-  sed -n '3,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '3,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-1}"
 }
 
 SHADINGS_CSV="hillshade"
 NAME=""
-PACKAGE_KMZ=0
+OUTPUTS_CSV=""
+COG_CRS=""
+COG_NO_REPROJECT=0
 GIS_DIR_OVERRIDE=""
 DOWNLOAD_LIST=""
 ALGORITHM=""
@@ -39,14 +51,16 @@ ORIG_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --shading)            SHADINGS_CSV="$2"; shift 2 ;;
-    --algorithm)          ALGORITHM="$2"; shift 2 ;;
-    --multidirectional)   MULTIDIRECTIONAL=1; shift ;;
-    --name)               NAME="$2"; shift 2 ;;
-    --gis-dir)            GIS_DIR_OVERRIDE="$2"; shift 2 ;;
-    --kmz)                PACKAGE_KMZ=1; shift ;;
-    --background)         BACKGROUND=1; shift ;;
-    --dry-run)            DRY_RUN=1; shift ;;
+    -s|--shading)         SHADINGS_CSV="$2"; shift 2 ;;
+    -a|--algorithm)       ALGORITHM="$2"; shift 2 ;;
+    -m|--multidirectional) MULTIDIRECTIONAL=1; shift ;;
+    -n|--name)            NAME="$2"; shift 2 ;;
+    -g|--gis-dir)         GIS_DIR_OVERRIDE="$2"; shift 2 ;;
+    -o|--output)          OUTPUTS_CSV="$2"; shift 2 ;;
+    --cog-crs)            COG_CRS="$2"; shift 2 ;;
+    --cog-no-reproject)   COG_NO_REPROJECT=1; shift ;;
+    -b|--background)      BACKGROUND=1; shift ;;
+    -d|--dry-run)         DRY_RUN=1; shift ;;
     -h|--help)            usage 0 ;;
     -*)                   echo "Unknown flag: $1" >&2; usage ;;
     *)
@@ -55,6 +69,44 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# ─── Resolve --output → OUTPUT_KML / OUTPUT_KMZ / OUTPUT_COG ─────────────────
+OUTPUT_KML=0
+OUTPUT_KMZ=0
+OUTPUT_COG=0
+[[ -z "${OUTPUTS_CSV}" ]] && OUTPUTS_CSV="kml"
+IFS=',' read -r -a _OUT_TOKENS <<< "${OUTPUTS_CSV}"
+for tok in "${_OUT_TOKENS[@]}"; do
+  case "${tok,,}" in
+    kml) OUTPUT_KML=1 ;;
+    kmz) OUTPUT_KMZ=1 ;;
+    cog) OUTPUT_COG=1 ;;
+    "")  echo "ERROR: --output got empty token" >&2; exit 1 ;;
+    *)   echo "ERROR: --output unknown: '${tok}' (known: kml, kmz, cog)" >&2; exit 1 ;;
+  esac
+done
+# kmz is just kml + zip; producing the zip requires the pyramid to exist.
+[[ ${OUTPUT_KMZ} -eq 1 ]] && OUTPUT_KML=1
+if [[ ${OUTPUT_KML} -eq 0 && ${OUTPUT_KMZ} -eq 0 && ${OUTPUT_COG} -eq 0 ]]; then
+  echo "ERROR: --output produced no outputs" >&2
+  exit 1
+fi
+
+# ─── Validate COG-modifier flags ─────────────────────────────────────────────
+if [[ -n "${COG_CRS}" ]]; then
+  [[ "${COG_CRS}" =~ ^EPSG:[0-9]+$ ]] || {
+    echo "ERROR: --cog-crs must match 'EPSG:NNNN' (got: ${COG_CRS})" >&2
+    exit 1
+  }
+fi
+if [[ -n "${COG_CRS}" || ${COG_NO_REPROJECT} -eq 1 ]] && [[ ${OUTPUT_COG} -eq 0 ]]; then
+  echo "ERROR: --cog-crs / --cog-no-reproject require --output to include cog" >&2
+  exit 1
+fi
+if [[ -n "${COG_CRS}" && ${COG_NO_REPROJECT} -eq 1 ]]; then
+  echo "ERROR: --cog-crs and --cog-no-reproject are mutually exclusive" >&2
+  exit 1
+fi
+
 [[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
 
 source "${LIDAR_HOME}/lib/common.sh"
@@ -62,6 +114,7 @@ source "${LIDAR_HOME}/lib/events.sh"
 source "${LIDAR_HOME}/lib/download.sh"
 source "${LIDAR_HOME}/lib/gdal.sh"
 source "${LIDAR_HOME}/lib/kml.sh"
+source "${LIDAR_HOME}/lib/cog.sh"
 
 [[ -z "${DOWNLOAD_LIST}" ]] && usage
 
@@ -69,7 +122,7 @@ source "${LIDAR_HOME}/lib/kml.sh"
 if [[ ${BACKGROUND} -eq 1 ]]; then
   CHILD_ARGS=()
   for a in "${ORIG_ARGS[@]}"; do
-    [[ "${a}" == "--background" ]] && continue
+    [[ "${a}" == "--background" || "${a}" == "-b" ]] && continue
     CHILD_ARGS+=("${a}")
   done
   EFFECTIVE_GIS_DIR="${GIS_DIR_OVERRIDE:-${GIS_DIR:-}}"
@@ -132,9 +185,15 @@ if [[ -z "${NAME}" ]]; then
 fi
 
 OUT_DIR="${KML_DIR}/${NAME}"
+COG_DIR="${LIDAR_DIR}/cog/${NAME}"
 
-if [[ -e "${OUT_DIR}" && ${DRY_RUN} -eq 0 ]]; then
+if [[ ${OUTPUT_KML} -eq 1 && -e "${OUT_DIR}" && ${DRY_RUN} -eq 0 ]]; then
   echo "ERROR: output directory already exists: ${OUT_DIR}" >&2
+  echo "  Choose a different --name or remove the existing directory." >&2
+  exit 1
+fi
+if [[ ${OUTPUT_COG} -eq 1 && -e "${COG_DIR}" && ${DRY_RUN} -eq 0 ]]; then
+  echo "ERROR: COG output directory already exists: ${COG_DIR}" >&2
   echo "  Choose a different --name or remove the existing directory." >&2
   exit 1
 fi
@@ -144,16 +203,32 @@ if [[ ${DRY_RUN} -eq 1 ]]; then
   WORK_DIR=$(mktemp -d "${LIDAR_DIR}/.work_XXXXXX")
   trap 'rm -rf "${WORK_DIR}"' EXIT
   extra_deps=()
-  [[ ${PACKAGE_KMZ} -eq 1 ]] && extra_deps+=(zip)
+  [[ ${OUTPUT_KMZ} -eq 1 ]] && extra_deps+=(zip)
+  [[ ${OUTPUT_COG} -eq 1 ]] && extra_deps+=(python3)
   check_deps_and_input "${DOWNLOAD_LIST}" "${extra_deps[@]+"${extra_deps[@]}"}"
+  OUTPUTS_PLAN=""
+  [[ ${OUTPUT_KML} -eq 1 ]] && OUTPUTS_PLAN+="kml "
+  [[ ${OUTPUT_KMZ} -eq 1 ]] && OUTPUTS_PLAN+="kmz "
+  [[ ${OUTPUT_COG} -eq 1 ]] && OUTPUTS_PLAN+="cog "
+  if [[ ${OUTPUT_COG} -eq 1 ]]; then
+    if [[ -n "${COG_CRS}" ]]; then
+      COG_CRS_PLAN="${COG_CRS} (explicit)"
+    elif [[ ${COG_NO_REPROJECT} -eq 1 ]]; then
+      COG_CRS_PLAN="native (no-reproject)"
+    else
+      COG_CRS_PLAN="auto (source CRS if projected; else UTM)"
+    fi
+  fi
   echo "=== DRY RUN PLAN ==="
   echo "Name        : ${NAME}"
   echo "Shadings    : ${SHADINGS[*]}"
   echo "Algorithm   : ${HS_ALGORITHM} (multidirectional=${HS_MULTIDIRECTIONAL})"
-  echo "Output dir  : ${OUT_DIR}"
+  echo "Outputs     : ${OUTPUTS_PLAN% }"
+  [[ ${OUTPUT_KML} -eq 1 ]] && echo "KML dir     : ${OUT_DIR}"
+  [[ ${OUTPUT_COG} -eq 1 ]] && echo "COG dir     : ${COG_DIR}"
+  [[ ${OUTPUT_COG} -eq 1 ]] && echo "COG CRS     : ${COG_CRS_PLAN}"
   echo "Tile list   : ${DOWNLOAD_LIST}"
   echo "Tile count  : ${TOTAL_TILES}"
-  echo "Package KMZ : ${PACKAGE_KMZ}"
   echo "GIS_DIR     : ${GIS_DIR}"
   exit 0
 fi
@@ -198,7 +273,8 @@ trap on_exit EXIT
 cleanup_old_logs 30
 
 extra_deps=()
-[[ ${PACKAGE_KMZ} -eq 1 ]] && extra_deps+=(zip)
+[[ ${OUTPUT_KMZ} -eq 1 ]] && extra_deps+=(zip)
+[[ ${OUTPUT_COG} -eq 1 ]] && extra_deps+=(python3)
 
 check_deps_and_input "${DOWNLOAD_LIST}" "${extra_deps[@]+"${extra_deps[@]}"}"
 LISTS_DIR="${WORK_DIR}/project_lists"
@@ -248,14 +324,18 @@ for PROJECT in "${PROJECT_NAMES[@]}"; do
   printf "    %-60s %5d tiles\n" "${PROJECT}" "${PROJECT_READY[${PROJECT}]}"
 done
 
-# ─── Step 6: Per-shading × per-project pyramids ──────────────────────────────
+# ─── Step 6: Per-shading × per-project shading derivation + KML pyramid ──────
 echo "=========================================="
-echo "STEP 6: Generating tile pyramids (${#SHADINGS[@]} shading(s) × ${#PROJECT_NAMES[@]} project(s))"
+if [[ ${OUTPUT_KML} -eq 1 ]]; then
+  echo "STEP 6: Deriving shadings + generating KML tile pyramids (${#SHADINGS[@]} shading(s) × ${#PROJECT_NAMES[@]} project(s))"
+else
+  echo "STEP 6: Deriving shadings (${#SHADINGS[@]} shading(s) × ${#PROJECT_NAMES[@]} project(s)) — KML pyramid skipped"
+fi
 echo "=========================================="
 
-mkdir -p "${OUT_DIR}"
+[[ ${OUTPUT_KML} -eq 1 ]] && mkdir -p "${OUT_DIR}"
 
-# Build per-project DEM VRTs once; reuse across shadings.
+# Build per-project DEM VRTs once; reuse across shadings (and COG).
 declare -A DEM_VRT=()
 for PROJECT in "${PROJECT_NAMES[@]}"; do
   VRT="${WORK_DIR}/${PROJECT}_dem.vrt"
@@ -264,14 +344,13 @@ for PROJECT in "${PROJECT_NAMES[@]}"; do
 done
 
 for SHADING in "${SHADINGS[@]}"; do
-  SHADING_DIR="${OUT_DIR}/${SHADING}"
-  mkdir -p "${SHADING_DIR}"
+  if [[ ${OUTPUT_KML} -eq 1 ]]; then
+    SHADING_DIR="${OUT_DIR}/${SHADING}"
+    mkdir -p "${SHADING_DIR}"
+  fi
 
   for PROJECT in "${PROJECT_NAMES[@]}"; do
-    PROJ_OUT="${SHADING_DIR}/${PROJECT}"
-    mkdir -p "${PROJ_OUT}"
     SHADE_TIF="${WORK_DIR}/${SHADING}_${PROJECT}.tif"
-    WGS84_TIF="${WORK_DIR}/${SHADING}_${PROJECT}_wgs84.tif"
 
     echo "------------------------------------------"
     echo "${SHADING} / ${PROJECT}  (${PROJECT_COUNT[${PROJECT}]} tiles)"
@@ -280,62 +359,108 @@ for SHADING in "${SHADINGS[@]}"; do
     echo "  Deriving ${SHADING}..."
     derive_shading "${SHADING}" "${DEM_VRT[${PROJECT}]}" "${SHADE_TIF}"
 
-    echo "  Reprojecting to WGS84..."
-    reproject_to_wgs84 "${SHADE_TIF}" "${WGS84_TIF}"
+    if [[ ${OUTPUT_KML} -eq 1 ]]; then
+      PROJ_OUT="${SHADING_DIR}/${PROJECT}"
+      WGS84_TIF="${WORK_DIR}/${SHADING}_${PROJECT}_wgs84.tif"
+      mkdir -p "${PROJ_OUT}"
 
-    echo "  Building tile pyramid..."
-    # min-zoom=0: gdal's auto-pick is "data fits in ~1 tile" which lands
-    # at zoom 7-8 for county-sized data. Tiles that small (≤1° on a side)
-    # fall under Google Earth's default 128-px LOD threshold at typical
-    # viewing altitudes, so the overlay stays invisible until you zoom
-    # deep in. Forcing min-zoom=0 produces overview tiles that span tens
-    # of degrees — easily clearing the LOD threshold at any altitude.
-    # --skip-blank drops the mostly-empty overview tiles for small data
-    # (PNG transparency compresses to ~nothing anyway), so storage cost
-    # is a handful of extra tiles per super-overlay.
-    #
-    # max-zoom explicit: gdal's auto-pick rounds down by one for sub-
-    # meter data (OSGeo/gdal#2799, #3460), so we still compute it.
-    # cubic resampling preserves alpha-edge fidelity; average bled
-    # nodata into neighbors across overview levels and produced halos.
-    MAX_ZOOM=$(compute_max_zoom "${WGS84_TIF}")
-    echo "  Zoom range: 0-${MAX_ZOOM} (min=world, max=native resolution)"
-    "${GDAL[@]}" raster tile \
-      --tiling-scheme WorldCRS84Quad \
-      --kml \
-      --webviewer none \
-      --min-zoom 0 \
-      --max-zoom "${MAX_ZOOM}" \
-      -r cubic \
-      --overview-resampling cubic \
-      --skip-blank \
-      --title "${PROJECT}" \
-      -j ALL_CPUS \
-      "${WGS84_TIF}" "${PROJ_OUT}"
+      echo "  Reprojecting to WGS84..."
+      reproject_to_wgs84 "${SHADE_TIF}" "${WGS84_TIF}"
 
-    # Inject <LookAt> so Google Earth focuses on the actual data instead
-    # of the union of world-spanning overview tile bounds.
-    if [[ -f "${PROJ_OUT}/doc.kml" ]]; then
-      read -r LK_LON LK_LAT LK_RANGE < <(compute_lookat "${WGS84_TIF}") || true
-      if [[ -n "${LK_LON:-}" ]]; then
-        inject_lookat "${PROJ_OUT}/doc.kml" "${LK_LON}" "${LK_LAT}" "${LK_RANGE}"
-        echo "  LookAt: ${LK_LON}, ${LK_LAT} @ ${LK_RANGE}m"
+      echo "  Building tile pyramid..."
+      # min-zoom=0: gdal's auto-pick is "data fits in ~1 tile" which lands
+      # at zoom 7-8 for county-sized data. Tiles that small (≤1° on a side)
+      # fall under Google Earth's default 128-px LOD threshold at typical
+      # viewing altitudes, so the overlay stays invisible until you zoom
+      # deep in. Forcing min-zoom=0 produces overview tiles that span tens
+      # of degrees — easily clearing the LOD threshold at any altitude.
+      # --skip-blank drops the mostly-empty overview tiles for small data
+      # (PNG transparency compresses to ~nothing anyway), so storage cost
+      # is a handful of extra tiles per super-overlay.
+      #
+      # max-zoom explicit: gdal's auto-pick rounds down by one for sub-
+      # meter data (OSGeo/gdal#2799, #3460), so we still compute it.
+      # cubic resampling preserves alpha-edge fidelity; average bled
+      # nodata into neighbors across overview levels and produced halos.
+      MAX_ZOOM=$(compute_max_zoom "${WGS84_TIF}")
+      echo "  Zoom range: 0-${MAX_ZOOM} (min=world, max=native resolution)"
+      "${GDAL[@]}" raster tile \
+        --tiling-scheme WorldCRS84Quad \
+        --kml \
+        --webviewer none \
+        --min-zoom 0 \
+        --max-zoom "${MAX_ZOOM}" \
+        -r cubic \
+        --overview-resampling cubic \
+        --skip-blank \
+        --title "${PROJECT}" \
+        -j ALL_CPUS \
+        "${WGS84_TIF}" "${PROJ_OUT}"
+
+      # Inject <LookAt> so Google Earth focuses on the actual data instead
+      # of the union of world-spanning overview tile bounds.
+      if [[ -f "${PROJ_OUT}/doc.kml" ]]; then
+        read -r LK_LON LK_LAT LK_RANGE < <(compute_lookat "${WGS84_TIF}") || true
+        if [[ -n "${LK_LON:-}" ]]; then
+          inject_lookat "${PROJ_OUT}/doc.kml" "${LK_LON}" "${LK_LAT}" "${LK_RANGE}"
+          echo "  LookAt: ${LK_LON}, ${LK_LAT} @ ${LK_RANGE}m"
+        fi
+        ensure_root_networklink "${PROJ_OUT}/doc.kml" "${PROJ_OUT}"
       fi
-      ensure_root_networklink "${PROJ_OUT}/doc.kml" "${PROJ_OUT}"
+
+      rm -f "${WGS84_TIF}"
     fi
 
-    rm -f "${SHADE_TIF}" "${WGS84_TIF}"
+    # SHADE_TIF (native CRS) is the COG source for Step 7. Keep it in
+    # WORK_DIR when cog output is requested; EXIT trap cleans WORK_DIR.
+    [[ ${OUTPUT_COG} -eq 1 ]] || rm -f "${SHADE_TIF}"
   done
 done
 
-# ─── Step 7: Optional KMZ packaging (one .kmz per super-overlay) ─────────────
+# ─── Step 7: Optional COG output (one DEM per project + one shade per pair) ──
+# Produces self-contained Cloud-Optimized GeoTIFFs in COG_DIR. CRS resolved
+# per project (cached on first call so the shade builders reuse the result).
+COG_PATHS=()
+if [[ ${OUTPUT_COG} -eq 1 ]]; then
+  echo "=========================================="
+  echo "STEP 7: Packaging COG (DEM + shadings)"
+  echo "=========================================="
+  mkdir -p "${COG_DIR}"
+  declare -A PROJECT_COG_CRS=()
+  COG_CRS_SUMMARY=""
+
+  for PROJECT in "${PROJECT_NAMES[@]}"; do
+    TARGET_CRS=$(cog_resolve_crs "${DEM_VRT[${PROJECT}]}")
+    PROJECT_COG_CRS["${PROJECT}"]="${TARGET_CRS}"
+    DEM_OUT="${COG_DIR}/${PROJECT}_dem.tif"
+    echo "  ${PROJECT}/dem → ${TARGET_CRS}"
+    build_cog_dem "${DEM_VRT[${PROJECT}]}" "${DEM_OUT}" "${TARGET_CRS}"
+    COG_PATHS+=("${DEM_OUT}")
+    COG_CRS_SUMMARY+="${PROJECT}=${TARGET_CRS} "
+  done
+
+  for SHADING in "${SHADINGS[@]}"; do
+    for PROJECT in "${PROJECT_NAMES[@]}"; do
+      SHADE_TIF="${WORK_DIR}/${SHADING}_${PROJECT}.tif"
+      SHADE_OUT="${COG_DIR}/${SHADING}__${PROJECT}.tif"
+      TARGET_CRS="${PROJECT_COG_CRS[${PROJECT}]}"
+      echo "  ${SHADING}/${PROJECT} → ${TARGET_CRS}"
+      build_cog_shade "${SHADE_TIF}" "${SHADE_OUT}" "${TARGET_CRS}"
+      COG_PATHS+=("${SHADE_OUT}")
+    done
+  done
+
+  write_cog_readme "${COG_DIR}" "${COG_CRS_SUMMARY% }"
+fi
+
+# ─── Step 8: Optional KMZ packaging (one .kmz per super-overlay) ─────────────
 # A KMZ archive expects exactly one doc.kml at its root. Each (shading,
 # project) super-overlay is independently complete, so we ship one KMZ
 # per super-overlay rather than zipping the whole tree.
 KMZ_PATHS=()
-if [[ ${PACKAGE_KMZ} -eq 1 ]]; then
+if [[ ${OUTPUT_KMZ} -eq 1 ]]; then
   echo "=========================================="
-  echo "STEP 7: Packaging KMZ (one per super-overlay)"
+  echo "STEP 8: Packaging KMZ (one per super-overlay)"
   echo "=========================================="
   KMZ_DIR="${LIDAR_DIR}/kmz/${NAME}"
   mkdir -p "${KMZ_DIR}"
@@ -353,17 +478,25 @@ fi
 echo "=========================================="
 echo "ALL DONE"
 echo "=========================================="
-echo "Pyramid root : ${OUT_DIR}/  ($(du -sh "${OUT_DIR}" | cut -f1))"
-echo ""
-echo "Super-overlays (open any in Google Earth via File → Open):"
-for SHADING in "${SHADINGS[@]}"; do
-  for PROJECT in "${PROJECT_NAMES[@]}"; do
-    echo "  ${OUT_DIR}/${SHADING}/${PROJECT}/doc.kml"
+if [[ ${OUTPUT_KML} -eq 1 ]]; then
+  echo "Pyramid root : ${OUT_DIR}/  ($(du -sh "${OUT_DIR}" | cut -f1))"
+  echo ""
+  echo "Super-overlays (open any in Google Earth via File → Open):"
+  for SHADING in "${SHADINGS[@]}"; do
+    for PROJECT in "${PROJECT_NAMES[@]}"; do
+      echo "  ${OUT_DIR}/${SHADING}/${PROJECT}/doc.kml"
+    done
   done
-done
+fi
 if [[ ${#KMZ_PATHS[@]} -gt 0 ]]; then
   echo ""
   echo "Portable KMZ files:"
   for k in "${KMZ_PATHS[@]}"; do echo "  ${k}"; done
+fi
+if [[ ${#COG_PATHS[@]} -gt 0 ]]; then
+  echo ""
+  echo "COG output (drop into QGIS / ArcGIS / any GeoTIFF reader):"
+  echo "  ${COG_DIR}/  ($(du -sh "${COG_DIR}" | cut -f1))"
+  echo "  README       : ${COG_DIR}/README.md"
 fi
 echo "=========================================="
