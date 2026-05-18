@@ -2,12 +2,14 @@
 # `lidar kill` — stop running pipeline(s).
 #
 # Usage:
-#   lidar kill <PID> [<PID>...]   kill specific tracked PIDs
-#   lidar kill --all              kill everything: events-tracked runs,
-#                                 lidar@*.service units, stray processes
+#   lidar kill <target> [<target>...]   kill specific tracked runs
+#                                       target = PID or run name/hex suffix
+#   lidar kill --all                    kill everything: events-tracked runs,
+#                                       lidar@*.service units, stray processes
 #
 # Bare PIDs are sanity-checked against the events index — refuses to kill
-# anything not currently tracked as a running lidar run.
+# anything not currently tracked as a running lidar run. Name/hex args are
+# resolved via the shared run-id resolver (see lib/events.sh).
 #
 # Options:
 #   --gis-dir PATH   override GIS_DIR
@@ -15,10 +17,10 @@
 
 source "${LIDAR_HOME}/lib/strict.sh"
 
-usage() { sed -n '3,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+usage() { sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
 
 KILL_ALL=0
-PIDS=()
+TARGETS=()
 GIS_DIR_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
@@ -27,15 +29,13 @@ while [[ $# -gt 0 ]]; do
     --gis-dir)   GIS_DIR_OVERRIDE="$2"; shift 2 ;;
     -h|--help)   usage 0 ;;
     -*)          echo "Unknown flag: $1" >&2; usage ;;
-    *)
-      [[ "$1" =~ ^[0-9]+$ ]] || { echo "Not a PID: $1" >&2; usage; }
-      PIDS+=("$1"); shift ;;
+    *)           TARGETS+=("$1"); shift ;;
   esac
 done
 
-[[ ${KILL_ALL} -eq 0 && ${#PIDS[@]} -eq 0 ]] && usage 2
-[[ ${KILL_ALL} -eq 1 && ${#PIDS[@]} -gt 0 ]] && {
-  echo "ERROR: --all and PID args are mutually exclusive" >&2; exit 2
+[[ ${KILL_ALL} -eq 0 && ${#TARGETS[@]} -eq 0 ]] && usage 2
+[[ ${KILL_ALL} -eq 1 && ${#TARGETS[@]} -gt 0 ]] && {
+  echo "ERROR: --all and target args are mutually exclusive" >&2; exit 2
 }
 
 [[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
@@ -76,15 +76,33 @@ kill_target() {
 
 killed=0
 
-if [[ ${#PIDS[@]} -gt 0 ]]; then
-  declare -A TRACKED=()
-  while read -r p id; do TRACKED["${p}"]="${id}"; done < <(running_pids)
-  for p in "${PIDS[@]}"; do
-    if [[ -z "${TRACKED[${p}]:-}" ]]; then
-      echo "  REFUSE PID ${p} — not a tracked running lidar run" >&2
-      exit 1
+if [[ ${#TARGETS[@]} -gt 0 ]]; then
+  declare -A TRACKED_BY_PID=()
+  declare -A PID_BY_ID=()
+  while read -r p id; do
+    TRACKED_BY_PID["${p}"]="${id}"
+    PID_BY_ID["${id}"]="${p}"
+  done < <(running_pids)
+
+  for t in "${TARGETS[@]}"; do
+    target_pid=""
+    target_id=""
+    if [[ "${t}" =~ ^[0-9]+$ ]]; then
+      if [[ -z "${TRACKED_BY_PID[${t}]:-}" ]]; then
+        echo "  REFUSE PID ${t} — not a tracked running lidar run" >&2
+        exit 1
+      fi
+      target_pid="${t}"
+      target_id="${TRACKED_BY_PID[${t}]}"
+    else
+      target_id=$(resolve_run_id "${t}") || exit 1
+      target_pid="${PID_BY_ID[${target_id}]:-}"
+      if [[ -z "${target_pid}" ]]; then
+        echo "  REFUSE '${t}' (${target_id}) — not currently running" >&2
+        exit 1
+      fi
     fi
-    kill_target "${p}" "PID ${p} (${TRACKED[${p}]})"
+    kill_target "${target_pid}" "PID ${target_pid} (${target_id})"
     killed=$((killed + 1))
   done
   echo "Sent TERM to ${killed} target(s)."
