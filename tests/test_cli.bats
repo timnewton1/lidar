@@ -39,6 +39,52 @@ setup() {
   [[ "${output}" == *"Horn or ZevenbergenThorne"* ]]
 }
 
+@test "lidar run --cog-crs with bad value errors before deps check" {
+  run "${LIDAR}" run --cog --cog-crs FOO "${FIXTURES}/one_tile.txt"
+  [ "${status}" -ne 0 ]
+  [[ "${output}" == *"--cog-crs must match"* ]]
+}
+
+@test "lidar run --cog-crs without --cog rejected" {
+  run "${LIDAR}" run --cog-crs EPSG:32614 "${FIXTURES}/one_tile.txt"
+  [ "${status}" -ne 0 ]
+  [[ "${output}" == *"require --cog"* ]]
+}
+
+@test "lidar run --cog-no-reproject without --cog rejected" {
+  run "${LIDAR}" run --cog-no-reproject "${FIXTURES}/one_tile.txt"
+  [ "${status}" -ne 0 ]
+  [[ "${output}" == *"require --cog"* ]]
+}
+
+@test "lidar run --cog-crs and --cog-no-reproject are mutually exclusive" {
+  run "${LIDAR}" run --cog --cog-crs EPSG:32614 --cog-no-reproject "${FIXTURES}/one_tile.txt"
+  [ "${status}" -ne 0 ]
+  [[ "${output}" == *"mutually exclusive"* ]]
+}
+
+@test "lidar run --cog-crs EPSG:32614 accepted (validation passes)" {
+  # Validation happens before deps; the run will fail later on flatpak/inputs,
+  # but the EPSG check itself must pass — i.e. no "--cog-crs must match" error.
+  run bash -c "\"${LIDAR}\" run --cog --cog-crs EPSG:32614 \"${FIXTURES}/one_tile.txt\" 2>&1 || true"
+  [[ "${output}" != *"--cog-crs must match"* ]]
+  [[ "${output}" != *"mutually exclusive"* ]]
+}
+
+@test "lidar run -c is equivalent to --cog (flag parses)" {
+  run bash -c "\"${LIDAR}\" run -c --cog-crs FOO \"${FIXTURES}/one_tile.txt\" 2>&1 || true"
+  # -c must trigger PACKAGE_COG=1 so --cog-crs FOO reaches the EPSG validator.
+  [[ "${output}" == *"--cog-crs must match"* ]]
+}
+
+@test "lidar run usage includes --cog options" {
+  run "${LIDAR}" run --help
+  [ "${status}" -eq 0 ]
+  [[ "${output}" == *"--cog"* ]]
+  [[ "${output}" == *"--cog-crs"* ]]
+  [[ "${output}" == *"--cog-no-reproject"* ]]
+}
+
 @test "lidar run --dry-run prints plan and exits 0" {
   # --dry-run on one_tile.txt still runs check_deps_and_input which verifies
   # flatpak is installed; skip that check by ensuring TOTAL_TILES is satisfied.

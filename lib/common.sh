@@ -33,6 +33,7 @@ GDALDEM=(flatpak       run --command=gdaldem        "${GDAL_FLATPAK_APP}")
 GDALINFO=(flatpak      run --command=gdalinfo       "${GDAL_FLATPAK_APP}")
 GDALWARP=(flatpak      run --command=gdalwarp       "${GDAL_FLATPAK_APP}")
 GDALBUILDVRT=(flatpak  run --command=gdalbuildvrt   "${GDAL_FLATPAK_APP}")
+GDALTRANSLATE=(flatpak run --command=gdal_translate "${GDAL_FLATPAK_APP}")
 
 # ─── Hillshade parameters ────────────────────────────────────────────────────
 HS_ALGORITHM=Horn          # Horn | ZevenbergenThorne
