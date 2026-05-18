@@ -36,7 +36,9 @@ done
 source "${LIDAR_HOME}/lib/common.sh"
 source "${LIDAR_HOME}/lib/events.sh"
 
-RUN_ID=$(resolve_run_id "${TARGET}") || exit 1
+resolve_input "${TARGET}" || exit 1
+[[ "${INPUT_TYPE}" == "run" ]] || { echo "ERROR: '${TARGET}' is a tile list, not a run — pass a run name or hex suffix" >&2; exit 1; }
+RUN_ID="${INPUT_RUN_ID}"
 
 # Look up log path and PID from events.
 ROW=$(jq -rs --arg id "${RUN_ID}" '
