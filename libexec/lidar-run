@@ -4,20 +4,20 @@
 # Usage: lidar run [options] <downloadlist.txt|URL>
 #
 # Options:
-#   --shading LIST       comma-separated shadings (default: hillshade)
-#                        Known: hillshade, slopeshade
-#   --algorithm ALG      hillshade algorithm: Horn (default) | ZevenbergenThorne
-#                        Horn is the safer default for noisy lidar DEMs.
-#   --multidirectional   use gdaldem -multidirectional (USGS's choice);
-#                        otherwise -combined with az=315 alt=45.
-#   --name NAME          output directory + root KML <name>
-#                        Default: superoverlay_TIMESTAMP
-#   --gis-dir PATH       override GIS_DIR for this run
-#   --kmz                also package the pyramid into a portable .kmz file
-#   --background         detach and run in the background; log to
-#                        GIS_DIR/lidar/logs/<name>.log. Prints PID + log path.
-#   --dry-run            validate inputs and print resolved plan; exit 0
-#   -h, --help           show this help
+#   -s, --shading LIST       comma-separated shadings (default: hillshade)
+#                            Known: hillshade, slopeshade
+#   -a, --algorithm ALG      hillshade algorithm: Horn (default) | ZevenbergenThorne
+#                            Horn is the safer default for noisy lidar DEMs.
+#   -m, --multidirectional   use gdaldem -multidirectional (USGS's choice);
+#                            otherwise -combined with az=315 alt=45.
+#   -n, --name NAME          output directory + root KML <name>
+#                            Default: superoverlay_TIMESTAMP
+#   -g, --gis-dir PATH       override GIS_DIR for this run
+#   -k, --kmz                also package the pyramid into a portable .kmz file
+#   -b, --background         detach and run in the background; log to
+#                            GIS_DIR/lidar/logs/<name>.log. Prints PID + log path.
+#   -d, --dry-run            validate inputs and print resolved plan; exit 0
+#   -h, --help               show this help
 
 source "${LIDAR_HOME}/lib/strict.sh"
 
@@ -39,14 +39,14 @@ ORIG_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --shading)            SHADINGS_CSV="$2"; shift 2 ;;
-    --algorithm)          ALGORITHM="$2"; shift 2 ;;
-    --multidirectional)   MULTIDIRECTIONAL=1; shift ;;
-    --name)               NAME="$2"; shift 2 ;;
-    --gis-dir)            GIS_DIR_OVERRIDE="$2"; shift 2 ;;
-    --kmz)                PACKAGE_KMZ=1; shift ;;
-    --background)         BACKGROUND=1; shift ;;
-    --dry-run)            DRY_RUN=1; shift ;;
+    -s|--shading)         SHADINGS_CSV="$2"; shift 2 ;;
+    -a|--algorithm)       ALGORITHM="$2"; shift 2 ;;
+    -m|--multidirectional) MULTIDIRECTIONAL=1; shift ;;
+    -n|--name)            NAME="$2"; shift 2 ;;
+    -g|--gis-dir)         GIS_DIR_OVERRIDE="$2"; shift 2 ;;
+    -k|--kmz)             PACKAGE_KMZ=1; shift ;;
+    -b|--background)      BACKGROUND=1; shift ;;
+    -d|--dry-run)         DRY_RUN=1; shift ;;
     -h|--help)            usage 0 ;;
     -*)                   echo "Unknown flag: $1" >&2; usage ;;
     *)
@@ -69,7 +69,7 @@ source "${LIDAR_HOME}/lib/kml.sh"
 if [[ ${BACKGROUND} -eq 1 ]]; then
   CHILD_ARGS=()
   for a in "${ORIG_ARGS[@]}"; do
-    [[ "${a}" == "--background" ]] && continue
+    [[ "${a}" == "--background" || "${a}" == "-b" ]] && continue
     CHILD_ARGS+=("${a}")
   done
   EFFECTIVE_GIS_DIR="${GIS_DIR_OVERRIDE:-${GIS_DIR:-}}"
