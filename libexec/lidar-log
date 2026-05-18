@@ -48,9 +48,7 @@ ROW=$(jq -rs --arg id "${RUN_ID}" '
   }
 ' "${EVENTS_FILE}")
 
-LOG_PATH=$(echo "${ROW}" | jq -r '.log')
-PID=$(echo "${ROW}" | jq -r '.pid')
-DONE=$(echo "${ROW}" | jq -r '.done')
+IFS=$'\t' read -r LOG_PATH PID DONE < <(echo "${ROW}" | jq -r '[.log, (.pid|tostring), (.done|tostring)] | @tsv')
 
 if [[ -z "${LOG_PATH}" || "${LOG_PATH}" == "null" || ! -f "${LOG_PATH}" ]]; then
   # Fall back to the canonical path — valid for runs where name == log filename.

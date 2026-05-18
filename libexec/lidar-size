@@ -41,11 +41,9 @@ LOG_FILE="${LIDAR_DIR}/logs/${RUN_ID}.log"
 
 printf '%s\n' "${RUN_ID}"
 
-fmt() { numfmt --to=iec --suffix=B --format='%.1f' "$1"; }
-
 row() {
   local label="$1" note="$2" path="$3" bytes="$4"
-  printf '  %-10s  %-16s  %8s  %s\n' "${label}" "${note}" "$(fmt "${bytes}")" "${path}"
+  printf '  %-10s  %-16s  %8s  %s\n' "${label}" "${note}" "$(human_bytes "${bytes}")" "${path}"
 }
 
 total_bytes=0
@@ -105,5 +103,5 @@ fi
 
 if [[ ${total_bytes} -gt 0 ]]; then
   printf '  ──────────────────────────────────────────────────────\n'
-  printf '  %-10s  %-16s  %8s\n' "total" "(excl. dem)" "$(fmt "${total_bytes}")"
+  printf '  %-10s  %-16s  %8s\n' "total" "(excl. dem)" "$(human_bytes "${total_bytes}")"
 fi
