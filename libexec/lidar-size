@@ -1,107 +1,143 @@
 #!/usr/bin/env bash
-# `lidar size` — show disk usage for a run's output files.
+# `lidar size` — estimate download size for a tile list.
 #
-# Breaks down: DEM source tiles (shared), KML pyramid, KMZ, and log.
-# DEM tiles are shared across runs and are labelled as such.
+# Checks the tile cache for already-downloaded tiles (actual bytes) and
+# HEAD-samples a random subset of pending tiles to extrapolate the rest.
+# If all tiles are cached the total is exact; otherwise it is an estimate.
 #
-# Usage: lidar size [options] <name|hex>
+# Usage: lidar size [options] <tile-list|name|hex>
+#
+# Arguments:
+#   <tile-list>   path or https:// URL to a .txt of tile URLs
+#   <name|hex>    run name or hex suffix — tile list is extracted from the run log
 #
 # Options:
 #   --gis-dir PATH   override GIS_DIR
+#   --sample N       tiles to HEAD-sample for pending estimate (default 5)
 #   -h, --help       show this help
 
 source "${LIDAR_HOME}/lib/strict.sh"
 
-usage() { sed -n '3,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+usage() { sed -n '3,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
 
 GIS_DIR_OVERRIDE=""
-TARGET=""
+TILE_LIST=""
+SAMPLE_N=5
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --gis-dir)  GIS_DIR_OVERRIDE="$2"; shift 2 ;;
+    --sample)   SAMPLE_N="$2"; shift 2 ;;
     -h|--help)  usage 0 ;;
     -*)         echo "Unknown flag: $1" >&2; usage ;;
-    *)          [[ -n "${TARGET}" ]] && { echo "Too many arguments" >&2; usage; }
-                TARGET="$1"; shift ;;
+    *)          [[ -n "${TILE_LIST}" ]] && { echo "Too many arguments" >&2; usage; }
+                TILE_LIST="$1"; shift ;;
   esac
 done
 
-[[ -z "${TARGET}" ]] && usage
+[[ -z "${TILE_LIST}" ]] && usage
 
 [[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
 source "${LIDAR_HOME}/lib/common.sh"
 source "${LIDAR_HOME}/lib/events.sh"
 
-RUN_ID=$(resolve_run_id "${TARGET}") || exit 1
+command -v curl >/dev/null || { echo "ERROR: curl not found" >&2; exit 1; }
 
-KML_DIR="${LIDAR_DIR}/kml/${RUN_ID}"
-KMZ_DIR="${LIDAR_DIR}/kmz/${RUN_ID}"
-LOG_FILE="${LIDAR_DIR}/logs/${RUN_ID}.log"
+# ─── Resolve input: tile list file/URL or run name/hex ───────────────────────
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf "${WORK_DIR}"' EXIT
 
-printf '%s\n' "${RUN_ID}"
+resolve_input "${TILE_LIST}" || exit 1
+if [[ -z "${INPUT_TILE_LIST}" ]]; then
+  echo "ERROR: could not determine tile list for run '${INPUT_RUN_ID}'" >&2; exit 1
+fi
+TILE_LIST="${INPUT_TILE_LIST}"
 
-row() {
-  local label="$1" note="$2" path="$3" bytes="$4"
-  printf '  %-10s  %-16s  %8s  %s\n' "${label}" "${note}" "$(human_bytes "${bytes}")" "${path}"
-}
-
-total_bytes=0
-
-# ─── DEM source tiles ────────────────────────────────────────────────────────
-# Projects are the leaf-level subdirectories under any shading in the pyramid.
-# Sizes come entirely from local filesystem — no URLs are fetched.
-# find -printf '%s\n' reads sizes from directory entries in one pass (fast at 10k+ tiles).
-dem_bytes=0
-dem_projects=()
-if [[ -d "${KML_DIR}" ]]; then
-  while IFS= read -r proj_dir; do
-    project="${proj_dir##*/}"
-    project_bytes=$(find "${DEM_DIR}" -maxdepth 1 -name "*${project}*.tif" \
-      -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
-    dem_bytes=$(( dem_bytes + project_bytes ))
-    dem_projects+=("${project}")
-  done < <(find "${KML_DIR}" -mindepth 2 -maxdepth 2 -type d | sort -u)
+if [[ "${TILE_LIST}" =~ ^https?:// ]]; then
+  fetched="${WORK_DIR}/tiles.txt"
+  echo "Fetching tile list: ${TILE_LIST}"
+  curl -L --retry 3 --fail-with-body --max-time 60 -o "${fetched}" "${TILE_LIST}" \
+    || { echo "ERROR: failed to fetch ${TILE_LIST}" >&2; exit 1; }
+  TILE_LIST="${fetched}"
 fi
 
-if [[ ${dem_bytes} -gt 0 ]]; then
-  note="(shared, ${#dem_projects[@]} project(s))"
-  row "dem tiles" "${note}" "${DEM_DIR}" "${dem_bytes}"
+FILTERED="${WORK_DIR}/filtered.txt"
+grep -i '\.tif' "${TILE_LIST}" | grep -v '^#' | grep -v '^[[:space:]]*$' > "${FILTERED}" || true
+TOTAL=$(wc -l < "${FILTERED}")
+if [[ "${TOTAL}" -eq 0 ]]; then
+  echo "ERROR: No .tif URLs found in ${TILE_LIST}" >&2; exit 1
 fi
 
-printf '  ──────────────────────────────────────────────────────\n'
+# ─── Walk tile list: split cached vs pending ──────────────────────────────────
+BYTES_CACHED=0
+TILES_CACHED=0
+TILES_PENDING=0
+PENDING_URLS=()
 
-# ─── Pyramid, KMZ, log ───────────────────────────────────────────────────────
-if [[ -d "${KML_DIR}" ]]; then
-  bytes=$(du -sb "${KML_DIR}" | cut -f1)
-  row "pyramid" "" "${KML_DIR}" "${bytes}"
-  total_bytes=$(( total_bytes + bytes ))
-else
-  printf '  %-10s  (not found: %s)\n' "pyramid" "${KML_DIR}"
-fi
+while IFS= read -r URL; do
+  [[ -z "${URL}" ]] && continue
+  BASENAME="${URL##*/}"; BASENAME="${BASENAME%.tif}"
+  TILE_TIF="${DEM_DIR}/${BASENAME}.tif"
+  if [[ -f "${TILE_TIF}" ]]; then
+    BYTES_CACHED=$(( BYTES_CACHED + $(stat -c %s "${TILE_TIF}") ))
+    TILES_CACHED=$(( TILES_CACHED + 1 ))
+  else
+    PENDING_URLS+=("${URL}")
+    TILES_PENDING=$(( TILES_PENDING + 1 ))
+  fi
+done < "${FILTERED}"
 
-if [[ -d "${KMZ_DIR}" ]]; then
-  kmz_count=0
-  kmz_bytes=0
-  while IFS= read -r f; do
-    [[ -z "${f}" ]] && continue
-    sz=$(stat -c '%s' "${f}")
-    kmz_bytes=$(( kmz_bytes + sz ))
-    kmz_count=$(( kmz_count + 1 ))
-  done < <(find "${KMZ_DIR}" -maxdepth 1 -type f -name '*.kmz')
-  if [[ ${kmz_count} -gt 0 ]]; then
-    row "kmz" "(${kmz_count} file(s))" "${KMZ_DIR}" "${kmz_bytes}"
-    total_bytes=$(( total_bytes + kmz_bytes ))
+# ─── Sample pending tiles for size estimate ───────────────────────────────────
+BYTES_PENDING_EST=0
+SAMPLE_OK=0
+
+if [[ ${TILES_PENDING} -gt 0 ]]; then
+  N=${SAMPLE_N}
+  [[ ${N} -gt ${TILES_PENDING} ]] && N=${TILES_PENDING}
+  echo "Sampling ${N} of ${TILES_PENDING} pending tiles..."
+  SAMPLE_BYTES=0
+  for i in $(shuf -i 0-$(( TILES_PENDING - 1 )) -n "${N}" 2>/dev/null \
+             || seq 0 $(( N - 1 ))); do
+    U="${PENDING_URLS[i]}"
+    SIZE=$(curl -sIL --max-time 15 "${U}" \
+           | awk 'tolower($1)=="content-length:" {gsub(/\r/,""); v=$2} END{print v}')
+    if [[ -n "${SIZE}" && "${SIZE}" -gt 0 ]]; then
+      SAMPLE_BYTES=$(( SAMPLE_BYTES + SIZE ))
+      SAMPLE_OK=$(( SAMPLE_OK + 1 ))
+    fi
+  done
+  if [[ ${SAMPLE_OK} -gt 0 ]]; then
+    AVG=$(( SAMPLE_BYTES / SAMPLE_OK ))
+    BYTES_PENDING_EST=$(( AVG * TILES_PENDING ))
+  else
+    echo "WARNING: HEAD sampling failed — pending size unknown" >&2
   fi
 fi
 
-if [[ -f "${LOG_FILE}" ]]; then
-  bytes=$(stat -c '%s' "${LOG_FILE}")
-  row "log" "" "${LOG_FILE}" "${bytes}"
-  total_bytes=$(( total_bytes + bytes ))
+# ─── Report ───────────────────────────────────────────────────────────────────
+echo ""
+printf '  Total tiles  : %d\n' "${TOTAL}"
+
+if [[ ${TILES_CACHED} -gt 0 ]]; then
+  printf '  Cached       : %d tiles  (%s actual)\n' \
+    "${TILES_CACHED}" "$(human_bytes "${BYTES_CACHED}")"
 fi
 
-if [[ ${total_bytes} -gt 0 ]]; then
-  printf '  ──────────────────────────────────────────────────────\n'
-  printf '  %-10s  %-16s  %8s\n' "total" "(excl. dem)" "$(human_bytes "${total_bytes}")"
+if [[ ${TILES_PENDING} -gt 0 ]]; then
+  if [[ ${SAMPLE_OK} -gt 0 ]]; then
+    AVG=$(( BYTES_PENDING_EST / TILES_PENDING ))
+    printf '  Pending      : %d tiles  (~%s estimated, avg %s/tile, n=%d)\n' \
+      "${TILES_PENDING}" "$(human_bytes "${BYTES_PENDING_EST}")" \
+      "$(human_bytes "${AVG}")" "${SAMPLE_OK}"
+    TOTAL_BYTES=$(( BYTES_CACHED + BYTES_PENDING_EST ))
+    printf '  ──────────────────────────────────────\n'
+    printf '  Total        : ~%s\n' "$(human_bytes "${TOTAL_BYTES}")"
+  else
+    printf '  Pending      : %d tiles  (size unknown — HEAD sampling failed)\n' \
+      "${TILES_PENDING}"
+  fi
+else
+  # All tiles already cached — total is exact
+  printf '  ──────────────────────────────────────\n'
+  printf '  Total        : %s  (all cached, exact)\n' "$(human_bytes "${BYTES_CACHED}")"
 fi

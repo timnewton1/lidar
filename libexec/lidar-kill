@@ -95,7 +95,9 @@ if [[ ${#TARGETS[@]} -gt 0 ]]; then
       target_pid="${t}"
       target_id="${TRACKED_BY_PID[${t}]}"
     else
-      target_id=$(resolve_run_id "${t}") || exit 1
+      resolve_input "${t}" || exit 1
+      [[ "${INPUT_TYPE}" == "run" ]] || { echo "  REFUSE '${t}' — is a tile list, not a run" >&2; exit 1; }
+      target_id="${INPUT_RUN_ID}"
       target_pid="${PID_BY_ID[${target_id}]:-}"
       if [[ -z "${target_pid}" ]]; then
         echo "  REFUSE '${t}' (${target_id}) — not currently running" >&2

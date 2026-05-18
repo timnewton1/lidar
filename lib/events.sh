@@ -74,6 +74,47 @@ resolve_run_id() {
   echo "${matches}"
 }
 
+# ─── Unified input resolver ───────────────────────────────────────────────────
+# resolve_input <arg>
+# Accepts a tile list (local file or https:// URL), a run name, or a hex suffix.
+# Sets globals (cleared on each call):
+#   INPUT_TYPE       "tile-list" | "run"
+#   INPUT_TILE_LIST  path or URL for tile-list type; extracted from run args for run type
+#   INPUT_RUN_ID     resolved run ID for run type; empty for tile-list type
+# Returns 0 on success, 1 with an error message on stderr on failure.
+resolve_input() {
+  local arg="$1"
+  INPUT_TYPE="" INPUT_TILE_LIST="" INPUT_RUN_ID=""
+
+  if [[ "${arg}" =~ ^https?:// ]]; then
+    INPUT_TYPE="tile-list"
+    INPUT_TILE_LIST="${arg}"
+    return 0
+  fi
+
+  if [[ -f "${arg}" ]]; then
+    INPUT_TYPE="tile-list"
+    INPUT_TILE_LIST="${arg}"
+    return 0
+  fi
+
+  local id
+  if id=$(resolve_run_id "${arg}" 2>/dev/null); then
+    INPUT_TYPE="run"
+    INPUT_RUN_ID="${id}"
+    # First non-flag positional in the stored args is the tile list path/URL.
+    INPUT_TILE_LIST=$(jq -rs --arg id "${id}" '
+      .[] | select(.id == $id and .event == "start") | .args
+      | map(select(startswith("-") | not)) | first // ""
+    ' "${EVENTS_FILE}" 2>/dev/null || echo "")
+    return 0
+  fi
+
+  # Emit the run resolver's error if it looks like a run query, else a generic one.
+  resolve_run_id "${arg}" >/dev/null || true
+  return 1
+}
+
 # ─── --list-runs implementation ──────────────────────────────────────────────
 # Args: filter_status limit since_secs show_all json_mode
 # Empty filter_status = all statuses; show_all=1 disables limit.
