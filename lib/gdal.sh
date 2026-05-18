@@ -78,49 +78,48 @@ _read_raster_dims() {
   [[ -n "${SIZE_X}" && -n "${SIZE_Y}" && -n "${PIXEL_SIZE}" ]]
 }
 
-# compute_max_zoom: lowest zoom where a tile pixel is no larger than a source
-# pixel — i.e. the source's native resolution with no information loss.
-# Solving (180 / (256 * 2^z)) ≤ px  →  z ≥ log2(180 / (256*px)). Uses ceil so
-# we land at-or-above native, never below. Clamped by ZOOM_MAX_CAP.
-# Usage: max_zoom=$(compute_max_zoom path/to/wgs84.tif)
-compute_max_zoom() {
+# compute_zoom_and_lookat: single gdalinfo call that emits both the max zoom
+# level and the LookAt "lon lat range" on two lines.
+# Combines what compute_max_zoom + compute_lookat used to do in two separate
+# Flatpak spawns — saves one bwrap invocation per (shading × project) pair.
+#
+# Output (two lines on stdout):
+#   <max_zoom>
+#   <lon> <lat> <range_m>
+#
+# Returns 1 if gdalinfo fails or any required field is missing.
+# Usage: { read -r MAX_ZOOM; read -r LK_LON LK_LAT LK_RANGE; } < <(compute_zoom_and_lookat tif)
+compute_zoom_and_lookat() {
   local tif="$1" SIZE_X SIZE_Y PIXEL_SIZE
   _read_raster_dims "${tif}" || { echo "ERROR: could not read raster dims from ${tif}" >&2; return 1; }
-  awk -v px="${PIXEL_SIZE}" -v wdeg="${WCQ_TILE_DEG_Z0}" -v tpx="${WCQ_TILE_PX}" -v cap="${ZOOM_MAX_CAP}" 'BEGIN {
+  # _read_raster_dims captures PIXEL_SIZE from the same gdalinfo run we need for
+  # lookat, but it only retains the scalar pixel size. For lookat we need corners
+  # too, so we run gdalinfo once more — but only once total for both outputs.
+  local info
+  info=$("${GDALINFO[@]}" "${tif}" 2>/dev/null) || return 1
+  local cx cy ulx uly lrx lry
+  cx=$(echo "${info}"  | { grep -oP '^Center\s*\(\s*\K-?[0-9.]+'                    || true; })
+  cy=$(echo "${info}"  | { grep -oP '^Center\s*\(\s*-?[0-9.]+,\s*\K-?[0-9.]+'       || true; })
+  ulx=$(echo "${info}" | { grep -oP '^Upper Left\s*\(\s*\K-?[0-9.]+'                || true; })
+  uly=$(echo "${info}" | { grep -oP '^Upper Left\s*\(\s*-?[0-9.]+,\s*\K-?[0-9.]+'   || true; })
+  lrx=$(echo "${info}" | { grep -oP '^Lower Right\s*\(\s*\K-?[0-9.]+'               || true; })
+  lry=$(echo "${info}" | { grep -oP '^Lower Right\s*\(\s*-?[0-9.]+,\s*\K-?[0-9.]+' || true; })
+  [[ -n "${cx}" && -n "${cy}" && -n "${ulx}" && -n "${uly}" && -n "${lrx}" && -n "${lry}" ]] \
+    || { echo "ERROR: could not parse corner coords from ${tif}" >&2; return 1; }
+  awk -v px="${PIXEL_SIZE}" \
+      -v wdeg="${WCQ_TILE_DEG_Z0}" -v tpx="${WCQ_TILE_PX}" -v cap="${ZOOM_MAX_CAP}" \
+      -v cx="${cx}" -v cy="${cy}" \
+      -v ulx="${ulx}" -v uly="${uly}" -v lrx="${lrx}" -v lry="${lry}" 'BEGIN {
+    # max zoom: lowest zoom where tile pixel ≤ source pixel
     raw = log(wdeg / (tpx * px)) / log(2)
-    z = int(raw); if (raw > z) z++   # ceil
+    z = int(raw); if (raw > z) z++
     if (z > cap) z = cap
     if (z < 1)   z = 1
     print z
-  }'
-}
-
-# compute_lookat: emit "lon lat range" for a KML <LookAt> centered on the
-# raster, with the camera range sized so the data ~fills the view. Needed
-# because forcing --min-zoom=0 makes the lowest pyramid tile span the world,
-# and Google Earth's "fly to" picks the union of contained features' bboxes
-# — which becomes Earth's centroid instead of the actual data center.
-# <LookAt> on the root Document overrides that camera calculation.
-# Usage: read lon lat range < <(compute_lookat path/to/wgs84.tif)
-compute_lookat() {
-  local tif="$1" info
-  info=$("${GDALINFO[@]}" "${tif}" 2>/dev/null) || return 1
-  local cx cy ulx uly lrx lry
-  cx=$(echo "${info}" | { grep -oP '^Center\s*\(\s*\K-?[0-9.]+'                          || true; })
-  cy=$(echo "${info}" | { grep -oP '^Center\s*\(\s*-?[0-9.]+,\s*\K-?[0-9.]+'             || true; })
-  ulx=$(echo "${info}" | { grep -oP '^Upper Left\s*\(\s*\K-?[0-9.]+'                     || true; })
-  uly=$(echo "${info}" | { grep -oP '^Upper Left\s*\(\s*-?[0-9.]+,\s*\K-?[0-9.]+'        || true; })
-  lrx=$(echo "${info}" | { grep -oP '^Lower Right\s*\(\s*\K-?[0-9.]+'                    || true; })
-  lry=$(echo "${info}" | { grep -oP '^Lower Right\s*\(\s*-?[0-9.]+,\s*\K-?[0-9.]+'       || true; })
-  [[ -n "${cx}" && -n "${cy}" && -n "${ulx}" && -n "${uly}" && -n "${lrx}" && -n "${lry}" ]] \
-    || { echo "ERROR: could not parse corner coords from ${tif}" >&2; return 1; }
-  awk -v cx="${cx}" -v cy="${cy}" \
-      -v ulx="${ulx}" -v uly="${uly}" -v lrx="${lrx}" -v lry="${lry}" 'BEGIN {
+    # lookat range: ~111 km/deg, 1.5× padding, 5 km floor
     w = lrx - ulx; if (w < 0) w = -w
     h = uly - lry; if (h < 0) h = -h
     ext_deg = (w > h ? w : h)
-    # ~111 km per degree of latitude; pad 1.5x so the data does not fill
-    # edge-to-edge. Floor at 5 km so tiny datasets are not absurdly close.
     range = ext_deg * 111000 * 1.5
     if (range < 5000) range = 5000
     printf "%s %s %d\n", cx, cy, range

@@ -22,8 +22,6 @@ LIDAR_DIR="${GIS_DIR}/lidar"
 DEM_DIR="${LIDAR_DIR}/tiles/dem"
 EVENTS_FILE="${LIDAR_DIR}/logs/runs.jsonl"
 
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-
 # ─── GDAL via QGIS flatpak ───────────────────────────────────────────────────
 # Migrated from gdal2tiles.py to `gdal raster tile` (GDAL 3.11+). gdal2tiles.py
 # is deprecated in GDAL 3.13 and removed in 3.15.
@@ -99,4 +97,15 @@ project_from_url() {
   local rest="${1#*/Projects/}"
   [[ "${rest}" == "$1" ]] && { echo ""; return; }
   echo "${rest%%/*}"
+}
+
+# Generate a unique "superoverlay_RRGGBB" name. Loops until
+# "${dir}/${name}${suffix}" does not exist, then echoes the name.
+gen_run_name() {
+  local dir="$1" suffix="${2:-}" name
+  while true; do
+    name="superoverlay_$(printf '%02x%02x%02x' $((RANDOM&255)) $((RANDOM&255)) $((RANDOM&255)))"
+    [[ ! -e "${dir}/${name}${suffix}" ]] && break
+  done
+  echo "${name}"
 }

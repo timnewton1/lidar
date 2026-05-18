@@ -16,84 +16,63 @@
 [[ -n "${_LIDAR_COG_LOADED:-}" ]] && return 0
 _LIDAR_COG_LOADED=1
 
-# Returns 0 if the raster has a geographic (degree-based) horizontal CRS.
-# Parses the WKT root keyword via gdalinfo -json + python3. Handles WKT1
-# (GEOGCS), WKT2 (GEOGCRS), and compound CRS (COMPD_CS/COMPOUNDCRS) where
-# only the horizontal axis matters. Defaults to "not geographic" on parse
-# error — safer not to reproject than to fail mid-run.
-#
-# Why not a substring check: PROJCRS WKT contains BASEGEOGCRS as a child,
-# so naive "GEOGCRS in wkt" produces false positives on projected rasters.
-_cog_is_geographic() {
-  local tif="$1" json
-  json=$("${GDALINFO[@]}" -json "${tif}" 2>/dev/null) || return 1
-  python3 - "$json" <<'PY' >/dev/null 2>&1
-import sys, json, re
-try:
-    d = json.loads(sys.argv[1])
-    wkt = d.get("coordinateSystem", {}).get("wkt", "").lstrip()
-    m = re.match(r'([A-Z_]+)\s*\[', wkt, re.IGNORECASE)
-    if not m:
-        sys.exit(1)
-    root = m.group(1).upper()
-    if root in ("GEOGCRS", "GEOGCS"):
-        sys.exit(0)
-    if root in ("COMPD_CS", "COMPOUNDCRS"):
-        # Compound: find the first child after the compound's own name string.
-        # The horizontal child immediately follows the quoted name + comma.
-        child = re.search(r',\s*([A-Z_]+)\s*\[', wkt, re.IGNORECASE)
-        if child and child.group(1).upper() in ("GEOGCRS", "GEOGCS"):
-            sys.exit(0)
-    sys.exit(1)
-except Exception:
-    sys.exit(1)
-PY
-}
-
-# Pick a UTM EPSG code from the raster centroid.
-# zone = floor((lon + 180) / 6) + 1
-# EPSG = 32600 + zone (north) or 32700 + zone (south)
-# Echoes "EPSG:NNNNN" on success, returns 1 on parse failure.
-_cog_pick_utm() {
-  local tif="$1" info cx cy
-  info=$("${GDALINFO[@]}" "${tif}" 2>/dev/null) || return 1
-  cx=$(echo "${info}" | { grep -oP '^Center\s*\(\s*\K-?[0-9.]+'              || true; })
-  cy=$(echo "${info}" | { grep -oP '^Center\s*\(\s*-?[0-9.]+,\s*\K-?[0-9.]+' || true; })
-  [[ -n "${cx}" && -n "${cy}" ]] || return 1
-  awk -v lon="${cx}" -v lat="${cy}" 'BEGIN {
-    zone = int((lon + 180) / 6) + 1
-    if (zone < 1)  zone = 1
-    if (zone > 60) zone = 60
-    base = (lat >= 0) ? 32600 : 32700
-    printf "EPSG:%d\n", base + zone
-  }'
-}
-
 # Resolve the target CRS for a raster based on flag precedence.
 # Echoes "EPSG:NNNN" (or other CRS spec). Always succeeds.
 # Args: <raster>
+#
+# A single gdalinfo -json call extracts both the WKT (to detect geographic CRS)
+# and cornerCoordinates.center (for UTM auto-pick). This avoids two Flatpak
+# spawns when the source is geographic — Flatpak bwrap overhead is 100-400 ms.
+#
+# Why not a substring check on the WKT: PROJCRS WKT contains BASEGEOGCRS as a
+# child, so naive "GEOGCRS in wkt" produces false positives on projected rasters.
 cog_resolve_crs() {
   local tif="$1"
   if [[ -n "${COG_CRS:-}" ]]; then
     echo "${COG_CRS}"
     return 0
   fi
-  if _cog_is_geographic "${tif}"; then
-    if [[ "${COG_NO_REPROJECT:-0}" -eq 1 ]]; then
-      echo "WARN: source CRS is geographic; QGIS 3D Map View may not render correctly without a projected CRS." >&2
-      echo "native"
-      return 0
-    fi
-    local utm
-    utm=$(_cog_pick_utm "${tif}") || {
-      echo "WARN: could not auto-pick UTM zone for ${tif}; using native CRS" >&2
-      echo "native"
-      return 0
-    }
-    echo "${utm}"
-    return 0
-  fi
-  echo "native"
+  local json
+  json=$("${GDALINFO[@]}" -json "${tif}" 2>/dev/null) || { echo "native"; return 0; }
+  python3 - "${json}" "${COG_NO_REPROJECT:-0}" <<'PY'
+import sys, json, re
+try:
+    d = json.loads(sys.argv[1])
+    no_reproject = sys.argv[2] == "1"
+
+    # Detect geographic CRS from WKT root keyword. Handles WKT1 (GEOGCS),
+    # WKT2 (GEOGCRS), and compound CRS where only the horizontal axis matters.
+    wkt = d.get("coordinateSystem", {}).get("wkt", "").lstrip()
+    m = re.match(r'([A-Z_]+)\s*\[', wkt, re.IGNORECASE)
+    root = m.group(1).upper() if m else ""
+    is_geo = root in ("GEOGCRS", "GEOGCS")
+    if not is_geo and root in ("COMPD_CS", "COMPOUNDCRS"):
+        child = re.search(r',\s*([A-Z_]+)\s*\[', wkt, re.IGNORECASE)
+        is_geo = bool(child and child.group(1).upper() in ("GEOGCRS", "GEOGCS"))
+
+    if not is_geo:
+        print("native")
+        sys.exit(0)
+
+    if no_reproject:
+        print("WARN: source CRS is geographic; QGIS 3D Map View may not render correctly without a projected CRS.", file=sys.stderr)
+        print("native")
+        sys.exit(0)
+
+    # Auto-pick UTM from WGS84 centroid embedded in gdalinfo -json output.
+    # cornerCoordinates.center is always in WGS84 regardless of source CRS.
+    center = d.get("cornerCoordinates", {}).get("center", [])
+    if len(center) < 2:
+        print("native")
+        sys.exit(0)
+    lon, lat = center[0], center[1]
+    zone = int((lon + 180) / 6) + 1
+    zone = max(1, min(60, zone))
+    base = 32600 if lat >= 0 else 32700
+    print(f"EPSG:{base + zone}")
+except Exception:
+    print("native")
+PY
 }
 
 # Build a COG from a DEM source (float32 elevation).
@@ -113,11 +92,13 @@ build_cog_dem() {
     src="${tmp_reproj}"
   fi
 
+  # AVERAGE preserves mean elevation across overview levels; BILINEAR is for
+  # upsampling and can create NoData holes at coarser zoom levels.
   "${GDALTRANSLATE[@]}" -of COG \
     -co COMPRESS=ZSTD \
     -co PREDICTOR=FLOATING_POINT \
     -co BLOCKSIZE=512 \
-    -co OVERVIEW_RESAMPLING=BILINEAR \
+    -co OVERVIEW_RESAMPLING=AVERAGE \
     "${src}" "${out}"
 
   [[ "${src}" != "${in}" ]] && rm -f "${tmp_reproj}"
@@ -142,10 +123,12 @@ build_cog_shade() {
     src="${tmp_reproj}"
   fi
 
+  # NEAREST avoids interpolation artifacts in uint8 visual rasters (hillshade,
+  # slopeshade). BILINEAR/AVERAGE can blend transparent edges into real pixels.
   "${GDALTRANSLATE[@]}" -of COG \
     -co COMPRESS=ZSTD \
     -co BLOCKSIZE=512 \
-    -co OVERVIEW_RESAMPLING=BILINEAR \
+    -co OVERVIEW_RESAMPLING=NEAREST \
     "${src}" "${out}"
 
   [[ "${src}" != "${in}" ]] && rm -f "${tmp_reproj}"

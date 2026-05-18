@@ -138,11 +138,8 @@ if [[ ${BACKGROUND} -eq 1 ]]; then
       exit 1
     fi
   else
-    while true; do
-      LOG_NAME="superoverlay_$(printf '%02x%02x%02x' $((RANDOM&255)) $((RANDOM&255)) $((RANDOM&255)))"
-      LOG_FILE="${LOG_DIR}/${LOG_NAME}.log"
-      [[ ! -e "${LOG_FILE}" ]] && break
-    done
+    LOG_NAME=$(gen_run_name "${LOG_DIR}" ".log")
+    LOG_FILE="${LOG_DIR}/${LOG_NAME}.log"
     # Pass the generated name to the child so run ID == log filename.
     CHILD_ARGS+=(--name "${LOG_NAME}")
   fi
@@ -178,10 +175,7 @@ fi
 KML_DIR="${LIDAR_DIR}/kml"
 
 if [[ -z "${NAME}" ]]; then
-  while true; do
-    NAME="superoverlay_$(printf '%02x%02x%02x' $((RANDOM&255)) $((RANDOM&255)) $((RANDOM&255)))"
-    [[ ! -e "${KML_DIR}/${NAME}" ]] && break
-  done
+  NAME=$(gen_run_name "${KML_DIR}")
 fi
 
 OUT_DIR="${KML_DIR}/${NAME}"
@@ -198,13 +192,14 @@ if [[ ${OUTPUT_COG} -eq 1 && -e "${COG_DIR}" && ${DRY_RUN} -eq 0 ]]; then
   exit 1
 fi
 
+extra_deps=()
+[[ ${OUTPUT_KMZ} -eq 1 ]] && extra_deps+=(zip)
+[[ ${OUTPUT_COG} -eq 1 ]] && extra_deps+=(python3)
+
 # ─── --dry-run: validate inputs and print plan ───────────────────────────────
 if [[ ${DRY_RUN} -eq 1 ]]; then
   WORK_DIR=$(mktemp -d "${LIDAR_DIR}/.work_XXXXXX")
   trap 'rm -rf "${WORK_DIR}"' EXIT
-  extra_deps=()
-  [[ ${OUTPUT_KMZ} -eq 1 ]] && extra_deps+=(zip)
-  [[ ${OUTPUT_COG} -eq 1 ]] && extra_deps+=(python3)
   check_deps_and_input "${DOWNLOAD_LIST}" "${extra_deps[@]+"${extra_deps[@]}"}"
   OUTPUTS_PLAN=""
   [[ ${OUTPUT_KML} -eq 1 ]] && OUTPUTS_PLAN+="kml "
@@ -272,10 +267,6 @@ trap on_exit EXIT
 
 cleanup_old_logs 30
 
-extra_deps=()
-[[ ${OUTPUT_KMZ} -eq 1 ]] && extra_deps+=(zip)
-[[ ${OUTPUT_COG} -eq 1 ]] && extra_deps+=(python3)
-
 check_deps_and_input "${DOWNLOAD_LIST}" "${extra_deps[@]+"${extra_deps[@]}"}"
 LISTS_DIR="${WORK_DIR}/project_lists"
 prescan
@@ -289,6 +280,7 @@ echo "=========================================="
 
 MISSING=0
 declare -A PROJECT_READY=()
+READY_PROJECTS=()
 for PROJECT in "${PROJECT_NAMES[@]}"; do
   URLS_FILE="${LISTS_DIR}/${PROJECT}.urls"
   LIST_FILE="${LISTS_DIR}/${PROJECT}.list"
@@ -306,11 +298,7 @@ for PROJECT in "${PROJECT_NAMES[@]}"; do
     fi
   done < "${URLS_FILE}"
   PROJECT_READY["${PROJECT}"]="${N}"
-done
-
-READY_PROJECTS=()
-for PROJECT in "${PROJECT_NAMES[@]}"; do
-  [[ "${PROJECT_READY[${PROJECT}]}" -gt 0 ]] && READY_PROJECTS+=("${PROJECT}")
+  [[ ${N} -gt 0 ]] && READY_PROJECTS+=("${PROJECT}")
 done
 PROJECT_NAMES=("${READY_PROJECTS[@]}")
 
@@ -382,7 +370,9 @@ for SHADING in "${SHADINGS[@]}"; do
       # meter data (OSGeo/gdal#2799, #3460), so we still compute it.
       # cubic resampling preserves alpha-edge fidelity; average bled
       # nodata into neighbors across overview levels and produced halos.
-      MAX_ZOOM=$(compute_max_zoom "${WGS84_TIF}")
+      local MAX_ZOOM LK_LON LK_LAT LK_RANGE
+      { read -r MAX_ZOOM; read -r LK_LON LK_LAT LK_RANGE; } \
+        < <(compute_zoom_and_lookat "${WGS84_TIF}") || true
       echo "  Zoom range: 0-${MAX_ZOOM} (min=world, max=native resolution)"
       "${GDAL[@]}" raster tile \
         --tiling-scheme WorldCRS84Quad \
@@ -400,7 +390,6 @@ for SHADING in "${SHADINGS[@]}"; do
       # Inject <LookAt> so Google Earth focuses on the actual data instead
       # of the union of world-spanning overview tile bounds.
       if [[ -f "${PROJ_OUT}/doc.kml" ]]; then
-        read -r LK_LON LK_LAT LK_RANGE < <(compute_lookat "${WGS84_TIF}") || true
         if [[ -n "${LK_LON:-}" ]]; then
           inject_lookat "${PROJ_OUT}/doc.kml" "${LK_LON}" "${LK_LAT}" "${LK_RANGE}"
           echo "  LookAt: ${LK_LON}, ${LK_LAT} @ ${LK_RANGE}m"
