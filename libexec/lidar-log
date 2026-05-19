@@ -1,74 +1,173 @@
 #!/usr/bin/env bash
 # `lidar log` — stream or page a run's log file.
 #
-# Usage: lidar log [options] <name|hex>
+# Usage: lidar log [options] [<name|hex>]
 #
-# Follows live output for running jobs (tail -f); pages completed logs
-# with less (or cat when stdout is not a TTY).
+# With no argument: opens an interactive fzf chooser (Tab to move, Enter to
+# select, Alt-Enter to open). Multiple selections open in tmux split panes
+# (one pane per file); single selection uses tail -f or less as usual.
 #
 # Options:
-#   -n, --lines N    show last N lines before following / paging (default: all)
-#   --gis-dir PATH   override GIS_DIR
-#   -h, --help       show this help
+#   -n, --lines N        show last N lines before following / paging (default: all)
+#   --layout LAYOUT      tmux pane layout for multi-log view (default: tiled)
+#                        values: tiled, even-vertical, even-horizontal, main-vertical, main-horizontal
+#   --no-tmux            disable tmux panes; fall back to interleaved tail -f
+#   --gis-dir PATH       override GIS_DIR
+#   -h, --help           show this help
 
 source "${LIDAR_HOME}/lib/strict.sh"
 
-usage() { sed -n '3,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+usage() { sed -n '3,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
 
 LINES=""
 GIS_DIR_OVERRIDE=""
 TARGET=""
+TMUX_LAYOUT="tiled"
+NO_TMUX=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -n|--lines)   LINES="$2"; shift 2 ;;
-    --gis-dir)    GIS_DIR_OVERRIDE="$2"; shift 2 ;;
-    -h|--help)    usage 0 ;;
-    -*)           echo "Unknown flag: $1" >&2; usage ;;
-    *)            [[ -n "${TARGET}" ]] && { echo "Too many arguments" >&2; usage; }
-                  TARGET="$1"; shift ;;
+    -n|--lines)    LINES="$2"; shift 2 ;;
+    --layout)      TMUX_LAYOUT="$2"; shift 2 ;;
+    --no-tmux)     NO_TMUX=1; shift ;;
+    --gis-dir)     GIS_DIR_OVERRIDE="$2"; shift 2 ;;
+    -h|--help)     usage 0 ;;
+    -*)            echo "Unknown flag: $1" >&2; usage ;;
+    *)             [[ -n "${TARGET}" ]] && { echo "Too many arguments" >&2; usage; }
+                   TARGET="$1"; shift ;;
   esac
 done
-
-[[ -z "${TARGET}" ]] && usage
 
 [[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
 source "${LIDAR_HOME}/lib/common.sh"
 source "${LIDAR_HOME}/lib/events.sh"
 
+# Open N log files in tmux split panes, one pane per file.
+# Rebalances after every split so tmux never hits "too small to split"
+# regardless of how many files are selected. Falls back to tail -f if
+# tmux is unavailable or --no-tmux is set.
+open_log_panes() {
+  local layout="$1"; shift
+  local files=("$@")
+  local n=${#files[@]}
+
+  if [[ ${NO_TMUX} -eq 0 ]] && command -v tmux >/dev/null 2>&1; then
+    local target
+    if [[ -n "${TMUX:-}" ]]; then
+      # Already inside tmux — open a new window; -P prints the new window target.
+      target=$(tmux new-window -P -n "lidar:log" "tail -f $(printf '%q' "${files[0]}")")
+    else
+      local sess="lidar-log-$$"
+      tmux new-session -d -s "${sess}" -n "lidar:log" \
+        "tail -f $(printf '%q' "${files[0]}")"
+      target="${sess}:lidar:log"
+    fi
+
+    for (( i=1; i<n; i++ )); do
+      tmux split-window -t "${target}" "tail -f $(printf '%q' "${files[$i]}")"
+      # Rebalance after each split — prevents "pane too small" for large N.
+      tmux select-layout -t "${target}" "${layout}"
+    done
+
+    # Final layout pass and focus first pane.
+    tmux select-layout -t "${target}" "${layout}"
+    tmux select-pane -t "${target}.0"
+
+    [[ -z "${TMUX:-}" ]] && exec tmux attach-session -t "${target%:*}"
+  else
+    exec tail -f "${files[@]}"
+  fi
+}
+
+# Resolve a run ID to its log path and running status.
+# Sets LOG_PATH and RUNNING (0/1). Returns 1 if log not found.
+resolve_log_path() {
+  local run_id="$1"
+  local row
+  row=$(jq -rs --arg id "${run_id}" '
+    [ .[] | select(.id == $id) ] |
+    {
+      log:  (map(select(.event=="start")) | last | .log),
+      pid:  (map(select(.event=="start")) | last | .pid),
+      done: (map(select(.event=="end"))   | length > 0)
+    }
+  ' "${EVENTS_FILE}")
+
+  IFS=$'\t' read -r LOG_PATH PID DONE < <(printf '%s' "${row}" | jq -r '[.log, (.pid|tostring), (.done|tostring)] | @tsv')
+
+  if [[ -z "${LOG_PATH}" || "${LOG_PATH}" == "null" || ! -f "${LOG_PATH}" ]]; then
+    local fallback="${LIDAR_DIR}/logs/${run_id}.log"
+    if [[ -f "${fallback}" ]]; then
+      LOG_PATH="${fallback}"
+    else
+      return 1
+    fi
+  fi
+
+  RUNNING=0
+  if [[ "${DONE}" == "false" && -n "${PID}" && "${PID}" != "null" ]]; then
+    kill -0 "${PID}" 2>/dev/null && RUNNING=1 || true
+  fi
+}
+
+# ─── Interactive chooser (no argument) ───────────────────────────────────────
+if [[ -z "${TARGET}" ]]; then
+  command -v fzf >/dev/null 2>&1 || {
+    echo "ERROR: fzf required for interactive chooser; pass a run name directly" >&2
+    exit 1
+  }
+
+  LIST_OUTPUT=$(list_runs "" 20 "" 0 0 2>&1)
+  if [[ "${LIST_OUTPUT}" == "(no matching runs)" || "${LIST_OUTPUT}" == "(no runs yet)" ]]; then
+    echo "${LIST_OUTPUT}"
+    exit 0
+  fi
+
+  SELECTED=$(printf '%s\n' "${LIST_OUTPUT}" | fzf \
+    --multi --header-lines=1 \
+    --prompt="log > " \
+    --header="Enter: select · Alt-Enter: open logs · Ctrl-A: select all" \
+    --bind="enter:toggle+down,alt-enter:accept,ctrl-a:select-all,ctrl-d:deselect-all" \
+    --height=~80% --layout=reverse) || exit 0
+
+  [[ -z "${SELECTED}" ]] && exit 0
+
+  LOG_PATHS=()
+  ANY_RUNNING=0
+
+  while IFS= read -r LINE; do
+    RUN_ID=$(printf '%s' "${LINE}" | awk '{print $6}')
+    [[ -z "${RUN_ID}" ]] && continue
+    resolve_log_path "${RUN_ID}" || continue
+    LOG_PATHS+=("${LOG_PATH}")
+    [[ ${RUNNING} -eq 1 ]] && ANY_RUNNING=1
+  done <<< "${SELECTED}"
+
+  [[ ${#LOG_PATHS[@]} -eq 0 ]] && exit 0
+
+  if [[ ${#LOG_PATHS[@]} -gt 1 ]]; then
+    open_log_panes "${TMUX_LAYOUT}" "${LOG_PATHS[@]}"
+    exit 0
+  fi
+
+  # Single file — existing tail/less behavior.
+  LOG_PATH="${LOG_PATHS[0]}"
+  if [[ ${ANY_RUNNING} -eq 1 ]]; then
+    exec tail -f "${LOG_PATH}"
+  else
+    [[ -t 1 ]] && exec less +G "${LOG_PATH}" || exec cat "${LOG_PATH}"
+  fi
+fi
+
+# ─── Named run (argument given) ───────────────────────────────────────────────
 resolve_input "${TARGET}" || exit 1
 [[ "${INPUT_TYPE}" == "run" ]] || { echo "ERROR: '${TARGET}' is a tile list, not a run — pass a run name or hex suffix" >&2; exit 1; }
 RUN_ID="${INPUT_RUN_ID}"
 
-# Look up log path and PID from events.
-ROW=$(jq -rs --arg id "${RUN_ID}" '
-  [ .[] | select(.id == $id) ] |
-  {
-    log:  (map(select(.event=="start")) | last | .log),
-    pid:  (map(select(.event=="start")) | last | .pid),
-    done: (map(select(.event=="end"))   | length > 0)
-  }
-' "${EVENTS_FILE}")
-
-IFS=$'\t' read -r LOG_PATH PID DONE < <(echo "${ROW}" | jq -r '[.log, (.pid|tostring), (.done|tostring)] | @tsv')
-
-if [[ -z "${LOG_PATH}" || "${LOG_PATH}" == "null" || ! -f "${LOG_PATH}" ]]; then
-  # Fall back to the canonical path — valid for runs where name == log filename.
-  FALLBACK="${LIDAR_DIR}/logs/${RUN_ID}.log"
-  if [[ -f "${FALLBACK}" ]]; then
-    LOG_PATH="${FALLBACK}"
-  else
-    echo "ERROR: log file not found for '${RUN_ID}'" >&2
-    echo "  Tried: ${LOG_PATH}" >&2
-    echo "  Tried: ${FALLBACK}" >&2
-    exit 1
-  fi
-fi
-
-RUNNING=0
-if [[ "${DONE}" == "false" && -n "${PID}" && "${PID}" != "null" ]]; then
-  kill -0 "${PID}" 2>/dev/null && RUNNING=1 || true
-fi
+resolve_log_path "${RUN_ID}" || {
+  echo "ERROR: log file not found for '${RUN_ID}'" >&2
+  exit 1
+}
 
 if [[ ${RUNNING} -eq 1 ]]; then
   TAIL_ARGS=(-f)
@@ -80,10 +179,6 @@ else
     [[ -n "${LINES}" ]] && LESS_ARGS=(+"$(( $(wc -l < "${LOG_PATH}") - LINES + 1 ))g")
     exec less "${LESS_ARGS[@]}" "${LOG_PATH}"
   else
-    if [[ -n "${LINES}" ]]; then
-      exec tail -n "${LINES}" "${LOG_PATH}"
-    else
-      exec cat "${LOG_PATH}"
-    fi
+    [[ -n "${LINES}" ]] && exec tail -n "${LINES}" "${LOG_PATH}" || exec cat "${LOG_PATH}"
   fi
 fi
