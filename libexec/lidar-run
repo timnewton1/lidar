@@ -253,7 +253,7 @@ events_emit_start "${NAME}" "${EVENT_LOG_PATH}" "${ORIG_ARGS[@]}"
 # is 5% of usable RAM per job, so wait for that much headroom — this naturally
 # queues concurrent jobs without needing a separate queue command.
 _mem_total_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
-_need_kb=$(( _mem_total_kb / 20 ))   # 5% of total RAM
+_need_kb=$(( _mem_total_kb * GDAL_CACHE_PCT / 100 ))
 while (( $(awk '/MemAvailable/{print $2}' /proc/meminfo) < _need_kb )); do
   echo "Waiting for $(( _need_kb / 1024 )) MB headroom..."
   sleep 10

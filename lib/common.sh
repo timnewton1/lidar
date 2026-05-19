@@ -33,6 +33,10 @@ GDALWARP=(flatpak      run --command=gdalwarp       "${GDAL_FLATPAK_APP}")
 GDALBUILDVRT=(flatpak  run --command=gdalbuildvrt   "${GDAL_FLATPAK_APP}")
 GDALTRANSLATE=(flatpak run --command=gdal_translate "${GDAL_FLATPAK_APP}")
 
+# GDAL 3.10+ defaults block cache to this percentage of usable RAM per job.
+# lidar-run uses this same value for its MemAvailable gate so the throttle
+# stays in sync with what GDAL will actually consume.
+GDAL_CACHE_PCT="${GDAL_CACHE_PCT:-5}"
 export GDAL_MAX_DATASET_POOL_RAM_USAGE="${GDAL_MAX_DATASET_POOL_RAM_USAGE:-1024}"
 
 # ─── Hillshade parameters ────────────────────────────────────────────────────
