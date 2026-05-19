@@ -33,20 +33,14 @@ GDALWARP=(flatpak      run --command=gdalwarp       "${GDAL_FLATPAK_APP}")
 GDALBUILDVRT=(flatpak  run --command=gdalbuildvrt   "${GDAL_FLATPAK_APP}")
 GDALTRANSLATE=(flatpak run --command=gdal_translate "${GDAL_FLATPAK_APP}")
 
-# GDAL memory sizing — derived from physical RAM so the defaults scale with
-# the machine rather than being tuned for one box.
-#   GDAL_CACHEMAX_MB        — block cache per job; 20% of RAM. With large VRT
-#                             mosaics (thousands of tiles) a small cache causes
-#                             GDAL to evict and reload the same source tiles
-#                             repeatedly. Override when running many concurrent
-#                             jobs (e.g. GDAL_CACHEMAX_MB=512 lidar run ...).
-#   GDAL_MAX_DATASET_POOL_RAM_USAGE — GDALProxyPool cap per job; 10% of RAM.
-#                             Default is 25% of RAM minus GDAL_CACHEMAX, which
-#                             exhausts RAM across concurrent jobs before any
-#                             computation runs.
+# GDAL memory sizing. GDAL_CACHEMAX_MB is the per-job block cache budget;
+# with large VRT mosaics (thousands of tiles) a small cache causes GDAL to
+# evict and reload source tiles repeatedly. Default is MemTotal/4 — sized so
+# four concurrent jobs fill RAM, and lidar-queue uses this value as the
+# MemAvailable gate before launching each new job. Override to taste.
 _TOTAL_RAM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
-GDAL_CACHEMAX_MB="${GDAL_CACHEMAX_MB:-$(( _TOTAL_RAM_MB * 20 / 100 ))}"
-export GDAL_MAX_DATASET_POOL_RAM_USAGE="${GDAL_MAX_DATASET_POOL_RAM_USAGE:-$(( _TOTAL_RAM_MB * 10 / 100 ))}"
+GDAL_CACHEMAX_MB="${GDAL_CACHEMAX_MB:-$(( _TOTAL_RAM_MB / 4 ))}"
+export GDAL_MAX_DATASET_POOL_RAM_USAGE="${GDAL_MAX_DATASET_POOL_RAM_USAGE:-$(( _TOTAL_RAM_MB / 16 ))}"
 unset _TOTAL_RAM_MB
 
 # ─── Hillshade parameters ────────────────────────────────────────────────────
