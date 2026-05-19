@@ -27,6 +27,7 @@ ZOOM_MAX_CAP=22
 derive_hillshade() {
   local in="$1" out="$2"
   local args=(hillshade "${in}" "${out}"
+    --config GDAL_CACHEMAX 256
     -z "${HS_Z_FACTOR}"
     -alg "${HS_ALGORITHM}"
     -compute_edges
@@ -45,7 +46,7 @@ derive_slopeshade() {
   local in="$1" out="$2"
   local slope_tif="${out%.tif}_slope.tif"
   local ramp="${out%.tif}_ramp.txt"
-  "${GDALDEM[@]}" slope "${in}" "${slope_tif}" \
+  "${GDALDEM[@]}" --config GDAL_CACHEMAX 256 slope "${in}" "${slope_tif}" \
     -compute_edges -co COMPRESS=DEFLATE -co TILED=YES -co BIGTIFF=YES
   cat > "${ramp}" <<'RAMP'
 0   255 255 255
