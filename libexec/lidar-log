@@ -156,6 +156,11 @@ resolve_log_path() {
 
 # ─── Interactive chooser (no argument) ───────────────────────────────────────
 if [[ -z "${TARGET}" ]]; then
+  if ! [[ -t 0 ]]; then
+    echo "ERROR: no run name given and stdin is not a terminal (cannot open interactive chooser)" >&2
+    exit 1
+  fi
+
   command -v fzf >/dev/null 2>&1 || {
     echo "ERROR: fzf required for interactive chooser; pass a run name directly" >&2
     exit 1

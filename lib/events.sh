@@ -197,7 +197,7 @@ list_runs() {
         }
     ) | sort_by(.started) | reverse
     | .[] | [.id, .started, .ended, (.pid|tostring), .log,
-             (.exit // "" | tostring), .last_event, (.duration_sec|tostring)] | join("")
+             (.exit // "" | tostring), .last_event, (.duration_sec|tostring)] | join("")
   ' "${EVENTS_FILE}")
 
   # Color only on TTY
