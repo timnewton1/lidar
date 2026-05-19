@@ -123,19 +123,6 @@ setup() {
   [[ "${output}" == *"testrun"* ]]
 }
 
-@test "lidar list --json on empty events file returns []" {
-  rm -f "${GIS_DIR}/lidar/logs/runs.jsonl"
-  run "${LIDAR}" list --json
-  [ "${status}" -eq 0 ]
-  [ "${output}" = "[]" ]
-}
-
-@test "lidar list --since 7y rejects bad duration" {
-  run "${LIDAR}" list --since 7y
-  [ "${status}" -ne 0 ]
-  [[ "${output}" == *"bad duration"* ]]
-}
-
 @test "lidar kill with no args exits 2" {
   run "${LIDAR}" kill
   [ "${status}" -eq 2 ]

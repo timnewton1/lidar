@@ -158,25 +158,21 @@ strip_restart_flags() {
 }
 
 # ─── --list-runs implementation ──────────────────────────────────────────────
-# Args: filter_status limit since_secs show_all json_mode
-# Empty filter_status = all statuses; show_all=1 disables limit.
+# Renders all recorded runs (newest-first) as a text table to stdout.
 list_runs() {
-  local filter_status="$1" limit="${2:-20}" since_secs="$3" show_all="$4" json_mode="$5"
-
   command -v jq >/dev/null || {
-    echo "ERROR: --list-runs requires jq (sudo dnf install jq)" >&2
+    echo "ERROR: list_runs requires jq (sudo dnf install jq)" >&2
     exit 1
   }
   if [[ ! -f "${EVENTS_FILE}" ]]; then
-    [[ "${json_mode}" == "1" ]] && echo "[]" || echo "(no runs yet)"
+    echo "(no runs yet)"
     return
   fi
 
-  local now_epoch; now_epoch=$(date +%s)
-
-  # jq collapses events to per-id rows: id, started, ended, pid, log, exit, last_event
+  # jq collapses events to per-id rows: id, started, ended, pid, log, exit, last_event, duration_sec
   # Sorted newest-first. Fields joined by ASCII US (0x1F) — non-whitespace, so
   # bash IFS preserves empty fields (tabs collapse under default whitespace IFS).
+  # duration_sec is computed in jq: if ended exists, use (ended - started), else (now - started).
   local rows
   rows=$(jq -s -r '
     group_by(.id) | map(
@@ -189,71 +185,20 @@ list_runs() {
           pid: ($s.pid // 0),
           log: ($s.log // ""),
           exit: (if $last.event=="end" then $last.exit else null end),
-          last_event: $last.event
+          last_event: $last.event,
+          duration_sec: (
+            if (if $last.event=="end" then $last.ts else "" end) != "" then
+              (((if $last.event=="end" then $last.ts else "" end) | fromdate) - ($s.ts | fromdate))
+            else
+              ((now | floor) - ($s.ts | fromdate))
+            end
+            | if . < 0 then 0 else . end
+          )
         }
     ) | sort_by(.started) | reverse
     | .[] | [.id, .started, .ended, (.pid|tostring), .log,
-             (.exit // "" | tostring), .last_event] | join("")
+             (.exit // "" | tostring), .last_event, (.duration_sec|tostring)] | join("")
   ' "${EVENTS_FILE}")
-
-  # Walk rows, compute status (including PID liveness) and duration,
-  # apply filters, accumulate.
-  local out_rows=()
-  local count=0
-  while IFS=$'\x1f' read -r id started ended pid log exit_code last_event; do
-    [[ -z "${id}" ]] && continue
-    local status
-    if [[ "${last_event}" == "end" ]]; then
-      [[ "${exit_code}" == "0" ]] && status="success" || status="failed"
-    else
-      if [[ "${pid}" -gt 0 ]] && kill -0 "${pid}" 2>/dev/null; then
-        status="running"
-      else
-        status="crashed"
-      fi
-    fi
-
-    [[ -n "${filter_status}" && "${filter_status}" != "${status}" ]] && continue
-
-    local start_epoch; start_epoch=$(date -d "${started}" +%s 2>/dev/null || echo 0)
-    if [[ -n "${since_secs}" && ${start_epoch} -gt 0 ]]; then
-      (( now_epoch - start_epoch > since_secs )) && continue
-    fi
-
-    local dur
-    if [[ -n "${ended}" ]]; then
-      local end_epoch; end_epoch=$(date -d "${ended}" +%s 2>/dev/null || echo "${now_epoch}")
-      dur=$(( end_epoch - start_epoch ))
-    else
-      dur=$(( now_epoch - start_epoch ))
-    fi
-    (( dur < 0 )) && dur=0
-
-    out_rows+=("${status}|${started}|${dur}|${id}|${log}|${exit_code}|${pid}")
-    count=$((count + 1))
-    if [[ "${show_all}" != "1" && ${count} -ge ${limit} ]]; then break; fi
-  done <<< "${rows}"
-
-  if [[ "${json_mode}" == "1" ]]; then
-    # Re-emit filtered set as JSON
-    local first=1
-    printf '['
-    for r in "${out_rows[@]+"${out_rows[@]}"}"; do
-      IFS='|' read -r status started dur id log exit_code pid <<< "${r}"
-      [[ ${first} -eq 1 ]] || printf ','
-      printf '{"status":"%s","started":"%s","duration_sec":%d,"id":"%s","log":"%s","exit":%s,"pid":%d}' \
-        "${status}" "${started}" "${dur}" "$(json_escape "${id}")" "$(json_escape "${log}")" \
-        "${exit_code:-null}" "${pid}"
-      first=0
-    done
-    printf ']\n'
-    return
-  fi
-
-  if [[ ${#out_rows[@]} -eq 0 ]]; then
-    echo "(no matching runs)"
-    return
-  fi
 
   # Color only on TTY
   local C_RESET="" C_OK="" C_FAIL="" C_RUN="" C_CRASH=""
@@ -266,8 +211,19 @@ list_runs() {
   fi
 
   printf "%-9s  %-19s  %9s  %-24s  %s\n" "STATUS" "STARTED" "DURATION" "NAME" "LOG"
-  for r in "${out_rows[@]}"; do
-    IFS='|' read -r status started dur id log exit_code pid <<< "${r}"
+  while IFS=$'\x1f' read -r id started ended pid log exit_code last_event duration_sec; do
+    [[ -z "${id}" ]] && continue
+    local status
+    if [[ "${last_event}" == "end" ]]; then
+      [[ "${exit_code}" == "0" ]] && status="success" || status="failed"
+    else
+      if [[ "${pid}" -gt 0 ]] && kill -0 "${pid}" 2>/dev/null; then
+        status="running"
+      else
+        status="crashed"
+      fi
+    fi
+
     local sym color
     case "${status}" in
       success) sym="✓ ok";    color="${C_OK}" ;;
@@ -276,11 +232,12 @@ list_runs() {
       crashed) sym="⊘ crash"; color="${C_CRASH}" ;;
       *)       sym="${status}"; color="" ;;
     esac
+
     # 2026-05-16T22:14:03Z → 2026-05-16 22:14:03
     local started_h="${started/T/ }"; started_h="${started_h%Z}"
-    local dur_h; dur_h=$(human_duration "${dur}")
+    local dur_h; dur_h=$(human_duration "${duration_sec}")
     local log_base="${log##*/}"
     printf "${color}%-9s${C_RESET}  %-19s  %9s  %-24s  %s\n" \
       "${sym}" "${started_h}" "${dur_h}" "${id}" "${log_base}"
-  done
+  done <<< "${rows}"
 }

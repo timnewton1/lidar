@@ -148,7 +148,7 @@ if [[ ${BACKGROUND} -eq 1 ]]; then
   nohup "${LIDAR_HOME}/lidar" run "${CHILD_ARGS[@]}" >"${LOG_FILE}" 2>&1 </dev/null &
   CHILD_PID=$!
   echo "  PID : ${CHILD_PID}"
-  echo "  (tracked in events index — see: lidar list)"
+  echo "  (tracked in events index — see: lidar log)"
   disown
   exit 0
 fi
