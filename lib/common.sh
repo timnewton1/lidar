@@ -33,13 +33,10 @@ GDALWARP=(flatpak      run --command=gdalwarp       "${GDAL_FLATPAK_APP}")
 GDALBUILDVRT=(flatpak  run --command=gdalbuildvrt   "${GDAL_FLATPAK_APP}")
 GDALTRANSLATE=(flatpak run --command=gdal_translate "${GDAL_FLATPAK_APP}")
 
-# GDAL memory sizing. GDAL_CACHEMAX_MB is the per-job block cache budget;
-# with large VRT mosaics (thousands of tiles) a small cache causes GDAL to
-# evict and reload source tiles repeatedly. 4 GB is workload-appropriate for
-# 1m lidar DEMs — enough tile locality to avoid thrashing without tying the
-# value to machine RAM. lidar-run waits for this much MemAvailable before
-# starting work, which naturally queues concurrent jobs. Override to taste.
-GDAL_CACHEMAX_MB="${GDAL_CACHEMAX_MB:-4096}"
+# GDAL 3.10+ defaults block cache to this percentage of usable RAM per job.
+# lidar-run uses this same value for its MemAvailable gate so the throttle
+# stays in sync with what GDAL will actually consume.
+GDAL_CACHE_PCT="${GDAL_CACHE_PCT:-5}"
 export GDAL_MAX_DATASET_POOL_RAM_USAGE="${GDAL_MAX_DATASET_POOL_RAM_USAGE:-1024}"
 
 # ─── Hillshade parameters ────────────────────────────────────────────────────
