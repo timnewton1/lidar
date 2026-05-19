@@ -117,8 +117,8 @@ if [[ -z "${TARGET}" ]]; then
     exit 1
   }
 
-  LIST_OUTPUT=$(list_runs "" 20 "" 0 0 2>&1)
-  if [[ "${LIST_OUTPUT}" == "(no matching runs)" || "${LIST_OUTPUT}" == "(no runs yet)" ]]; then
+  LIST_OUTPUT=$(list_runs 2>&1)
+  if [[ "${LIST_OUTPUT}" == "(no runs yet)" ]]; then
     echo "${LIST_OUTPUT}"
     exit 0
   fi

@@ -163,7 +163,7 @@ make_dirs() {
 #
 # Per-tile status lines are written via `flock /dev/stderr` so they don't
 # interleave. Per-tile percentage/EWMA ETA is not shown (meaningless when
-# many tiles run concurrently); use `lidar list` to track overall progress.
+# many tiles run concurrently); use `lidar log` to track overall progress.
 
 # Per-URL worker called by xargs. Exported so the subshells inherit it.
 _lidar_download_one() {
