@@ -115,6 +115,48 @@ resolve_input() {
   return 1
 }
 
+# ─── Restart arg reconstruction ──────────────────────────────────────────────
+# Given a run ID, emit the args to use for a restart — one arg per line.
+# --background/-b is stripped (the caller adds it). --name/-n is stripped and
+# re-emitted with an incremented suffix: foo → foo_2, foo_2 → foo_3. If the
+# run had no --name, none is emitted (lets lidar-run generate a fresh one).
+strip_restart_flags() {
+  local id="$1"
+
+  local orig_name
+  orig_name=$(jq -rs --arg id "$id" '
+    [ .[] | select(.id==$id and .event=="start") ] | last | .args // []
+    | . as $a
+    | [ range(length) | . as $i
+        | if ($a[$i] == "--name" or $a[$i] == "-n") then $a[$i+1] // empty
+          else empty
+          end ] | first // ""
+  ' "${EVENTS_FILE}")
+
+  jq -rs --arg id "$id" '
+    [ .[] | select(.id==$id and .event=="start") ] | last | .args // []
+    | . as $a
+    | [ range(length) | . as $i
+        | if $a[$i] == "--background" or $a[$i] == "-b" then empty
+          elif ($a[$i] == "--name" or $a[$i] == "-n") then empty
+          elif $i > 0 and ($a[$i-1] == "--name" or $a[$i-1] == "-n") then empty
+          else $a[$i]
+          end ]
+    | .[]
+  ' "${EVENTS_FILE}"
+
+  if [[ -n "${orig_name}" ]]; then
+    local new_name
+    if [[ "${orig_name}" =~ ^(.+)_([0-9]+)$ ]]; then
+      new_name="${BASH_REMATCH[1]}_$(( BASH_REMATCH[2] + 1 ))"
+    else
+      new_name="${orig_name}_2"
+    fi
+    echo "--name"
+    echo "${new_name}"
+  fi
+}
+
 # ─── --list-runs implementation ──────────────────────────────────────────────
 # Args: filter_status limit since_secs show_all json_mode
 # Empty filter_status = all statuses; show_all=1 disables limit.
