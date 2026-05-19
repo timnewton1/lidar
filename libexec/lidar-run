@@ -370,7 +370,6 @@ for SHADING in "${SHADINGS[@]}"; do
       # meter data (OSGeo/gdal#2799, #3460), so we still compute it.
       # cubic resampling preserves alpha-edge fidelity; average bled
       # nodata into neighbors across overview levels and produced halos.
-      local MAX_ZOOM LK_LON LK_LAT LK_RANGE
       { read -r MAX_ZOOM; read -r LK_LON LK_LAT LK_RANGE; } \
         < <(compute_zoom_and_lookat "${WGS84_TIF}") || true
       echo "  Zoom range: 0-${MAX_ZOOM} (min=world, max=native resolution)"

@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# `lidar rerun` — kill a run (if alive) and restart it with the same args.
+#
+# Usage: lidar rerun <target> [<target>...]
+#
+# Each target is a run name or hex suffix (same syntax as lidar kill/log).
+# If the run is currently running it is killed and confirmed dead before the
+# new run is started. Finished (failed/crashed) runs are restarted directly.
+# Each restart runs in the background under a fresh auto-generated name.
+#
+# Options:
+#   --gis-dir PATH   override GIS_DIR
+#   -h, --help       show this help
+
+source "${LIDAR_HOME}/lib/strict.sh"
+
+usage() { sed -n '3,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+
+TARGETS=()
+GIS_DIR_OVERRIDE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --gis-dir)  GIS_DIR_OVERRIDE="$2"; shift 2 ;;
+    -h|--help)  usage 0 ;;
+    -*)         echo "Unknown flag: $1" >&2; usage ;;
+    *)          TARGETS+=("$1"); shift ;;
+  esac
+done
+
+[[ ${#TARGETS[@]} -eq 0 ]] && usage 2
+
+[[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
+source "${LIDAR_HOME}/lib/common.sh"
+source "${LIDAR_HOME}/lib/events.sh"
+
+# Return the PID recorded for a run ID if that process is still alive, else empty.
+live_pid_for() {
+  local id="$1"
+  local pid
+  pid=$(jq -rs --arg id "$id" '
+    [ .[] | select(.id==$id and .event=="start") ] | last | .pid // 0
+  ' "${EVENTS_FILE}" 2>/dev/null || echo 0)
+  [[ "${pid}" -gt 0 ]] && kill -0 "${pid}" 2>/dev/null && echo "${pid}" || true
+}
+
+# Strip --name/-n (plus its value) and --background/-b from a JSON args array,
+# then print the args one-per-line for consumption by mapfile.
+strip_restart_flags() {
+  local id="$1"
+  jq -rs --arg id "$id" '
+    [ .[] | select(.id==$id and .event=="start") ] | last | .args
+    | . as $a
+    | [ range(length) | . as $i
+        | if $a[$i] == "--background" or $a[$i] == "-b" then empty
+          elif ($a[$i] == "--name" or $a[$i] == "-n") then empty
+          elif $i > 0 and ($a[$i-1] == "--name" or $a[$i-1] == "-n") then empty
+          else $a[$i]
+          end ]
+    | .[]
+  ' "${EVENTS_FILE}"
+}
+
+for target in "${TARGETS[@]}"; do
+  echo "=== ${target} ==="
+
+  run_id=$(resolve_run_id "${target}") || exit 1
+
+  # Kill if alive, then wait for confirmed death.
+  pid=$(live_pid_for "${run_id}")
+  if [[ -n "${pid}" ]]; then
+    echo "  Killing ${run_id} (pid=${pid})..."
+    "${LIDAR_HOME}/libexec/lidar-kill" "${target}" ${GIS_DIR_OVERRIDE:+--gis-dir "${GIS_DIR_OVERRIDE}"}
+
+    deadline=$(( $(date +%s) + 30 ))
+    while kill -0 "${pid}" 2>/dev/null; do
+      if [[ $(date +%s) -ge ${deadline} ]]; then
+        echo "ERROR: ${run_id} (pid=${pid}) still alive after 30 s — aborting rerun" >&2
+        exit 1
+      fi
+      sleep 0.5
+    done
+    echo "  Confirmed dead."
+  else
+    echo "  Not running — skipping kill."
+  fi
+
+  # Reconstruct args, stripping --name and --background so the restart gets
+  # a fresh auto-generated name and always runs detached.
+  mapfile -t restart_args < <(strip_restart_flags "${run_id}")
+
+  if [[ ${#restart_args[@]} -eq 0 ]]; then
+    echo "ERROR: no args recorded for ${run_id}" >&2
+    exit 1
+  fi
+
+  echo "  Restarting..."
+  "${LIDAR_HOME}/libexec/lidar-run" --background "${restart_args[@]}" \
+    ${GIS_DIR_OVERRIDE:+--gis-dir "${GIS_DIR_OVERRIDE}"}
+done
