@@ -5,13 +5,16 @@
 #
 # With no argument: opens an interactive fzf chooser (Tab to move, Enter to
 # select, Alt-Enter to open). Multiple selections open in tmux split panes
-# (one pane per file); single selection uses tail -f or less as usual.
+# (one pane per file); single selection uses tail -F or pager as usual.
 #
 # Options:
 #   -n, --lines N        show last N lines before following / paging (default: all)
+#   --height N           fzf chooser height; fzf syntax accepted (~30, 80%) (default: ~30)
 #   --layout LAYOUT      tmux pane layout for multi-log view (default: tiled)
 #                        values: tiled, even-vertical, even-horizontal, main-vertical, main-horizontal
-#   --no-tmux            disable tmux panes; fall back to interleaved tail -f
+#   --no-follow          use pager even for running logs instead of tail -F
+#   --no-tmux            disable tmux panes; fall back to interleaved tail -F
+#   --pager CMD          pager for completed logs; overrides $LIDAR_PAGER / $PAGER (default: less)
 #   --gis-dir PATH       override GIS_DIR
 #   -h, --help           show this help
 
@@ -24,12 +27,18 @@ GIS_DIR_OVERRIDE=""
 TARGET=""
 TMUX_LAYOUT="tiled"
 NO_TMUX=0
+HEIGHT="~30"
+NO_FOLLOW=0
+PAGER_CMD=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -n|--lines)    LINES="$2"; shift 2 ;;
+    --height)      HEIGHT="$2"; shift 2 ;;
     --layout)      TMUX_LAYOUT="$2"; shift 2 ;;
+    --no-follow)   NO_FOLLOW=1; shift ;;
     --no-tmux)     NO_TMUX=1; shift ;;
+    --pager)       PAGER_CMD="$2"; shift 2 ;;
     --gis-dir)     GIS_DIR_OVERRIDE="$2"; shift 2 ;;
     -h|--help)     usage 0 ;;
     -*)            echo "Unknown flag: $1" >&2; usage ;;
@@ -42,9 +51,42 @@ done
 source "${LIDAR_HOME}/lib/common.sh"
 source "${LIDAR_HOME}/lib/events.sh"
 
+# Resolve pager: --pager flag > $LIDAR_PAGER env > $PAGER env > less
+_get_pager() { printf '%s' "${PAGER_CMD:-${LIDAR_PAGER:-${PAGER:-less}}}"; }
+
+# Build a tail -F shell command string for use inside tmux panes.
+# Always -F (survives log rotation). Applies --lines if set.
+_tail_cmd_str() {
+  local f; f=$(printf '%q' "$1")
+  if [[ -n "${LINES}" ]]; then
+    printf 'tail -n %s -F %s' "${LINES}" "${f}"
+  else
+    printf 'tail -F %s' "${f}"
+  fi
+}
+
+# Exec pager on a log file, applying --lines and --pager precedence.
+_exec_pager() {
+  local log="$1"
+  local pager; pager=$(_get_pager)
+  if [[ "${pager}" == "less" ]]; then
+    if [[ -n "${LINES}" ]]; then
+      local total; total=$(wc -l < "${log}")
+      local start=$(( total - LINES + 1 ))
+      (( start < 1 )) && start=1
+      exec less +"${start}g" "${log}"
+    else
+      exec less +G "${log}"
+    fi
+  else
+    read -ra _pw <<< "${pager}"
+    exec "${_pw[@]}" "${log}"
+  fi
+}
+
 # Open N log files in tmux split panes, one pane per file.
 # Rebalances after every split so tmux never hits "too small to split"
-# regardless of how many files are selected. Falls back to tail -f if
+# regardless of how many files are selected. Falls back to tail -F if
 # tmux is unavailable or --no-tmux is set.
 open_log_panes() {
   local layout="$1"; shift
@@ -52,19 +94,19 @@ open_log_panes() {
   local n=${#files[@]}
 
   if [[ ${NO_TMUX} -eq 0 ]] && command -v tmux >/dev/null 2>&1; then
-    local target
+    local target cmd0
+    cmd0=$(_tail_cmd_str "${files[0]}")
     if [[ -n "${TMUX:-}" ]]; then
       # Already inside tmux — open a new window; -P prints the new window target.
-      target=$(tmux new-window -P -n "lidar:log" "tail -f $(printf '%q' "${files[0]}")")
+      target=$(tmux new-window -P -n "lidar:log" "${cmd0}")
     else
       local sess="lidar-log-$$"
-      tmux new-session -d -s "${sess}" -n "lidar:log" \
-        "tail -f $(printf '%q' "${files[0]}")"
+      tmux new-session -d -s "${sess}" -n "lidar:log" "${cmd0}"
       target="${sess}:lidar:log"
     fi
 
     for (( i=1; i<n; i++ )); do
-      tmux split-window -t "${target}" "tail -f $(printf '%q' "${files[$i]}")"
+      tmux split-window -t "${target}" "$(_tail_cmd_str "${files[$i]}")"
       # Rebalance after each split — prevents "pane too small" for large N.
       tmux select-layout -t "${target}" "${layout}"
     done
@@ -75,7 +117,9 @@ open_log_panes() {
 
     [[ -z "${TMUX:-}" ]] && exec tmux attach-session -t "${target%:*}"
   else
-    exec tail -f "${files[@]}"
+    local _tf=(-F)
+    [[ -n "${LINES}" ]] && _tf=(-n "${LINES}" -F)
+    exec tail "${_tf[@]}" "${files[@]}"
   fi
 }
 
@@ -128,7 +172,7 @@ if [[ -z "${TARGET}" ]]; then
     --prompt="log > " \
     --header="Enter: select · Alt-Enter: open logs · Ctrl-A: select all" \
     --bind="enter:toggle+down,alt-enter:accept,ctrl-a:select-all,ctrl-d:deselect-all" \
-    --height=~80% --layout=reverse) || exit 0
+    --height="${HEIGHT}" --layout=reverse) || exit 0
 
   [[ -z "${SELECTED}" ]] && exit 0
 
@@ -150,12 +194,16 @@ if [[ -z "${TARGET}" ]]; then
     exit 0
   fi
 
-  # Single file — existing tail/less behavior.
+  # Single file — follow running logs unless --no-follow.
   LOG_PATH="${LOG_PATHS[0]}"
-  if [[ ${ANY_RUNNING} -eq 1 ]]; then
-    exec tail -f "${LOG_PATH}"
+  if [[ ${ANY_RUNNING} -eq 1 && ${NO_FOLLOW} -eq 0 ]]; then
+    _tf=(-F)
+    [[ -n "${LINES}" ]] && _tf=(-n "${LINES}" -F)
+    exec tail "${_tf[@]}" "${LOG_PATH}"
+  elif [[ -t 1 ]]; then
+    _exec_pager "${LOG_PATH}"
   else
-    [[ -t 1 ]] && exec less +G "${LOG_PATH}" || exec cat "${LOG_PATH}"
+    [[ -n "${LINES}" ]] && exec tail -n "${LINES}" "${LOG_PATH}" || exec cat "${LOG_PATH}"
   fi
 fi
 
@@ -169,15 +217,13 @@ resolve_log_path "${RUN_ID}" || {
   exit 1
 }
 
-if [[ ${RUNNING} -eq 1 ]]; then
-  TAIL_ARGS=(-f)
-  [[ -n "${LINES}" ]] && TAIL_ARGS=(-n "${LINES}" -f)
-  exec tail "${TAIL_ARGS[@]}" "${LOG_PATH}"
+if [[ ${RUNNING} -eq 1 && ${NO_FOLLOW} -eq 0 ]]; then
+  _tf=(-F)
+  [[ -n "${LINES}" ]] && _tf=(-n "${LINES}" -F)
+  exec tail "${_tf[@]}" "${LOG_PATH}"
 else
   if [[ -t 1 ]]; then
-    LESS_ARGS=(+G)  # start at end
-    [[ -n "${LINES}" ]] && LESS_ARGS=(+"$(( $(wc -l < "${LOG_PATH}") - LINES + 1 ))g")
-    exec less "${LESS_ARGS[@]}" "${LOG_PATH}"
+    _exec_pager "${LOG_PATH}"
   else
     [[ -n "${LINES}" ]] && exec tail -n "${LINES}" "${LOG_PATH}" || exec cat "${LOG_PATH}"
   fi
