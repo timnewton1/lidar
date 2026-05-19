@@ -249,15 +249,16 @@ if [[ ! -t 1 ]]; then
 fi
 events_emit_start "${NAME}" "${EVENT_LOG_PATH}" "${ORIG_ARGS[@]}"
 
-# Gate on available RAM before doing any real work. GDAL_CACHEMAX_MB (from
-# lib/common.sh) is the per-job budget, so this naturally queues jobs beyond
-# total_RAM / GDAL_CACHEMAX_MB without needing a separate queue command.
-_need_kb=$(( GDAL_CACHEMAX_MB * 1024 ))
+# Gate on available RAM before doing any real work. GDAL's own default cache
+# is 5% of usable RAM per job, so wait for that much headroom — this naturally
+# queues concurrent jobs without needing a separate queue command.
+_mem_total_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+_need_kb=$(( _mem_total_kb / 20 ))   # 5% of total RAM
 while (( $(awk '/MemAvailable/{print $2}' /proc/meminfo) < _need_kb )); do
-  echo "Waiting for ${GDAL_CACHEMAX_MB} MB headroom..."
+  echo "Waiting for $(( _need_kb / 1024 )) MB headroom..."
   sleep 10
 done
-unset _need_kb
+unset _need_kb _mem_total_kb
 
 WORK_DIR=$(mktemp -d "${LIDAR_DIR}/.work_XXXXXX")
 
