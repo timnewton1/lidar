@@ -360,7 +360,7 @@ for SHADING in "${SHADINGS[@]}"; do
 
     if [[ ${OUTPUT_KML} -eq 1 ]]; then
       PROJ_OUT="${SHADING_DIR}/${PROJECT}"
-      WGS84_TIF="${WORK_DIR}/${SHADING}_${PROJECT}_wgs84.tif"
+      WGS84_TIF=$(mktemp --suffix=_wgs84.tif)
       mkdir -p "${PROJ_OUT}"
 
       echo "  Reprojecting to WGS84..."
