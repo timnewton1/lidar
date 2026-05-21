@@ -12,7 +12,7 @@ _LIDAR_EVENTS_LOADED=1
 # Requires lib/common.sh (for EVENTS_FILE, LIDAR_DIR, json_escape).
 
 events_emit_start() {
-  local id="$1" log="$2"; shift 2
+  local id="$1" log="$2" project="$3"; shift 3
   mkdir -p "$(dirname "${EVENTS_FILE}")"
   local ts; ts=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
   local args_json="[" first=1 a
@@ -22,8 +22,9 @@ events_emit_start() {
     first=0
   done
   args_json+="]"
-  printf '{"id":"%s","event":"start","ts":"%s","pid":%d,"log":"%s","args":%s}\n' \
-    "$(json_escape "${id}")" "${ts}" "$$" "$(json_escape "${log}")" "${args_json}" \
+  printf '{"id":"%s","event":"start","ts":"%s","pid":%d,"log":"%s","project":"%s","args":%s}\n' \
+    "$(json_escape "${id}")" "${ts}" "$$" "$(json_escape "${log}")" \
+    "$(json_escape "${project}")" "${args_json}" \
     >> "${EVENTS_FILE}"
 }
 

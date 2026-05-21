@@ -135,3 +135,12 @@ setup() {
   [[ "${output}" == *"REFUSE PID 1"* ]]
 }
 
+@test "events_emit_start writes project field" {
+  source "${LIDAR_HOME}/lib/common.sh"
+  source "${LIDAR_HOME}/lib/events.sh"
+  events_emit_start "aabbcc" "" "TestProject"
+  local row
+  row=$(tail -1 "${GIS_DIR}/lidar/logs/runs.jsonl")
+  [[ "${row}" == *'"project":"TestProject"'* ]]
+}
+

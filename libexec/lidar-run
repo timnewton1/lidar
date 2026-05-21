@@ -263,7 +263,7 @@ if [[ ! -t 1 ]]; then
   EVENT_LOG_PATH=$(readlink -f "/proc/$$/fd/1" 2>/dev/null || true)
   [[ "${EVENT_LOG_PATH}" == /dev/* ]] && EVENT_LOG_PATH=""
 fi
-events_emit_start "${NAME}" "${EVENT_LOG_PATH}" "${ORIG_ARGS[@]}"
+events_emit_start "${NAME}" "${EVENT_LOG_PATH}" "" "${ORIG_ARGS[@]}"
 
 # Gate on available RAM before doing any real work. GDAL's own default cache
 # is 5% of usable RAM per job, so wait for that much headroom — this naturally
