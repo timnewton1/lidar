@@ -10,8 +10,6 @@
 #                            Horn is the safer default for noisy lidar DEMs.
 #   -m, --multidirectional   use gdaldem -multidirectional (USGS's choice);
 #                            otherwise -combined with az=315 alt=45.
-#   -n, --name NAME          output directory + root KML <name>
-#                            Default: superoverlay_TIMESTAMP
 #   -g, --gis-dir PATH       override GIS_DIR for this run
 #   -o, --output OUTPUTS     comma-separated outputs (default: kml).
 #                            Known: kml, kmz, cog.
@@ -151,6 +149,7 @@ fi
 
 # ─── Combine all inputs into one URL stream ──────────────────────────────────
 COMBINED_LIST=$(mktemp "${LIDAR_DIR}/.combined_XXXXXX.txt")
+trap 'rm -f "${COMBINED_LIST}"' EXIT
 
 for _inp in "${INPUTS[@]}"; do
   if [[ "${_inp}" =~ ^https?://.*\.tif([?#]|$) ]]; then
