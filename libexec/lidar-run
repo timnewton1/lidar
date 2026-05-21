@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # `lidar run` — download USGS lidar tiles and produce KML/KMZ/COG outputs.
 #
-# Usage: lidar run [options] <downloadlist.txt|URL>
+# Usage: lidar run [options] <downloadlist.txt|URL> [<downloadlist.txt|URL>...]
 #
 # Options:
 #   -s, --shading LIST       comma-separated shadings (default: hillshade)
@@ -24,15 +24,13 @@
 #                            CRS if projected, else auto-pick UTM zone)
 #       --cog-no-reproject   keep source CRS even if geographic (warns; QGIS
 #                            3D Map View may not render geographic CRSes)
-#   -b, --background         detach and run in the background; log to
-#                            GIS_DIR/lidar/logs/<name>.log. Prints PID + log path.
 #   -d, --dry-run            validate inputs and print resolved plan; exit 0
 #   -h, --help               show this help
 
 source "${LIDAR_HOME}/lib/strict.sh"
 
 usage() {
-  sed -n '3,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '3,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-1}"
 }
 
@@ -42,7 +40,7 @@ OUTPUTS_CSV=""
 COG_CRS=""
 COG_NO_REPROJECT=0
 GIS_DIR_OVERRIDE=""
-DOWNLOAD_LIST=""
+INPUTS=()
 ALGORITHM=""
 MULTIDIRECTIONAL=0
 BACKGROUND=0
@@ -63,9 +61,7 @@ while [[ $# -gt 0 ]]; do
     -d|--dry-run)         DRY_RUN=1; shift ;;
     -h|--help)            usage 0 ;;
     -*)                   echo "Unknown flag: $1" >&2; usage ;;
-    *)
-      [[ -n "${DOWNLOAD_LIST}" ]] && { echo "Too many arguments" >&2; usage; }
-      DOWNLOAD_LIST="$1"; shift ;;
+    *)  INPUTS+=("$1"); shift ;;
   esac
 done
 
@@ -116,7 +112,7 @@ source "${LIDAR_HOME}/lib/gdal.sh"
 source "${LIDAR_HOME}/lib/kml.sh"
 source "${LIDAR_HOME}/lib/cog.sh"
 
-[[ -z "${DOWNLOAD_LIST}" ]] && usage
+[[ ${#INPUTS[@]} -eq 0 ]] && usage
 
 # ─── --background: re-exec detached, log to file, print PID, exit ────────────
 if [[ ${BACKGROUND} -eq 1 ]]; then
@@ -152,6 +148,27 @@ if [[ ${BACKGROUND} -eq 1 ]]; then
   disown
   exit 0
 fi
+
+# ─── Combine all inputs into one URL stream ──────────────────────────────────
+COMBINED_LIST=$(mktemp "${LIDAR_DIR}/.combined_XXXXXX.txt")
+
+for _inp in "${INPUTS[@]}"; do
+  if [[ "${_inp}" =~ ^https?://.*\.tif([?#]|$) ]]; then
+    echo "${_inp}" >> "${COMBINED_LIST}"
+  elif [[ "${_inp}" =~ ^https?:// ]]; then
+    _fetched=$(mktemp "${LIDAR_DIR}/.fetch_XXXXXX.txt")
+    curl -L --retry 5 --retry-all-errors --fail-with-body --max-time 120 \
+      -o "${_fetched}.partial" "${_inp}" \
+      || { echo "ERROR: failed to fetch ${_inp}" >&2; rm -f "${_fetched}.partial" "${_fetched}"; exit 1; }
+    mv -f "${_fetched}.partial" "${_fetched}"
+    grep -i '\.tif' "${_fetched}" | grep -v '^#' | grep -v '^[[:space:]]*$' >> "${COMBINED_LIST}" || true
+    rm -f "${_fetched}"
+  else
+    [[ -f "${_inp}" ]] || { echo "ERROR: File not found: ${_inp}" >&2; exit 1; }
+    grep -i '\.tif' "${_inp}" | grep -v '^#' | grep -v '^[[:space:]]*$' >> "${COMBINED_LIST}" || true
+  fi
+done
+DOWNLOAD_LIST="${COMBINED_LIST}"
 
 # ─── Parse + validate shadings ───────────────────────────────────────────────
 IFS=',' read -r -a SHADINGS <<< "${SHADINGS_CSV}"
@@ -222,7 +239,7 @@ if [[ ${DRY_RUN} -eq 1 ]]; then
   [[ ${OUTPUT_KML} -eq 1 ]] && echo "KML dir     : ${OUT_DIR}"
   [[ ${OUTPUT_COG} -eq 1 ]] && echo "COG dir     : ${COG_DIR}"
   [[ ${OUTPUT_COG} -eq 1 ]] && echo "COG CRS     : ${COG_CRS_PLAN}"
-  echo "Tile list   : ${DOWNLOAD_LIST}"
+  echo "Inputs      : ${INPUTS[*]}"
   echo "Tile count  : ${TOTAL_TILES}"
   echo "GIS_DIR     : ${GIS_DIR}"
   exit 0
@@ -266,6 +283,7 @@ on_exit() {
   local rc=$?
   events_emit_end "${NAME}" "${rc}"
   [[ -n "${WORK_DIR:-}" ]] && rm -rf "${WORK_DIR}"
+  rm -f "${COMBINED_LIST:-}"
 }
 # When bash is signaled mid-wait, $? in the EXIT trap reads as 0 even though
 # the process exits 128+N — so killed runs were getting recorded as success.
