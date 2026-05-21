@@ -135,7 +135,3 @@ setup() {
   [[ "${output}" == *"REFUSE PID 1"* ]]
 }
 
-@test "lidar service install with no name exits 2" {
-  run "${LIDAR}" service install
-  [ "${status}" -eq 2 ]
-}

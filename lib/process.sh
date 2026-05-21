@@ -14,9 +14,9 @@ running_pids() {
       (map(select(.event=="start"))[0]) as $s
       | .[-1] as $last
       | select($last.event != "end")
-      | [$s.id, ($s.pid|tostring)] | join("")
+      | [($s.pid|tostring), $s.id] | join(" ")
     ) | .[]
-  ' "${EVENTS_FILE}" | while IFS=$'\x1f' read -r id pid; do
+  ' "${EVENTS_FILE}" | while read -r pid id; do
     [[ -z "${pid}" || "${pid}" == "0" ]] && continue
     kill -0 "${pid}" 2>/dev/null && echo "${pid} ${id}" || true
   done
