@@ -21,6 +21,7 @@ fi
 LIDAR_DIR="${GIS_DIR}/lidar"
 DEM_DIR="${LIDAR_DIR}/tiles/dem"
 EVENTS_FILE="${LIDAR_DIR}/logs/runs.jsonl"
+PROJECTS_DIR="${LIDAR_DIR}/projects"
 
 # ─── GDAL via QGIS flatpak ───────────────────────────────────────────────────
 # Migrated from gdal2tiles.py to `gdal raster tile` (GDAL 3.11+). gdal2tiles.py
@@ -114,4 +115,40 @@ gen_run_name() {
     [[ ! -e "${dir}/${name}${suffix}" ]] && break
   done
   echo "${name}"
+}
+
+# Generate a unique 6-char lowercase hex run ID.
+gen_hex_id() {
+  printf '%02x%02x%02x' $((RANDOM & 255)) $((RANDOM & 255)) $((RANDOM & 255))
+}
+
+# Group a stream of tile URLs by USGS project.
+# Reads URLs on stdin. Writes per-project temp files under WORK_DIR.
+# Prints "project<TAB>url_file" for each unique project (one per line).
+# $1 = fallback: project name for URLs with no Projects/<X>/ segment.
+#      Pass "" to silently drop those URLs.
+fanout_by_project() {
+  local fallback="$1"
+  [[ -n "${WORK_DIR:-}" ]] || { echo "ERROR: WORK_DIR not set" >&2; return 1; }
+
+  declare -A _fp_files=()
+
+  while IFS= read -r _url; do
+    [[ -z "${_url}" ]] && continue
+    [[ "${_url}" == '#'* ]] && continue
+    local _proj
+    _proj=$(project_from_url "${_url}")
+    if [[ -z "${_proj}" ]]; then
+      [[ -n "${fallback}" ]] && _proj="${fallback}" || continue
+    fi
+    if [[ -z "${_fp_files[${_proj}]:-}" ]]; then
+      _fp_files["${_proj}"]=$(mktemp "${WORK_DIR}/fanout_XXXXXX.urls")
+    fi
+    echo "${_url}" >> "${_fp_files[${_proj}]}"
+  done
+
+  local _p
+  for _p in "${!_fp_files[@]}"; do
+    printf '%s\t%s\n' "${_p}" "${_fp_files[${_p}]}"
+  done
 }

@@ -96,3 +96,54 @@ setup() {
   run is_known_shading gibberish
   [ "${status}" -ne 0 ]
 }
+
+@test "gen_hex_id returns 6 lowercase hex chars" {
+  result=$(gen_hex_id)
+  [[ "${result}" =~ ^[0-9a-f]{6}$ ]]
+}
+
+@test "gen_hex_id returns different values on repeated calls" {
+  a=$(gen_hex_id); b=$(gen_hex_id); c=$(gen_hex_id)
+  [[ "${a}" != "${b}" || "${b}" != "${c}" ]]
+}
+
+@test "fanout_by_project groups by USGS project" {
+  WORK_DIR=$(mktemp -d); trap 'rm -rf "${WORK_DIR}"' EXIT
+  result=$(printf '%s\n%s\n' \
+    "https://prd-tnm.s3.amazonaws.com/Foo/Projects/AK_Test_2020/TIFF/a.tif" \
+    "https://prd-tnm.s3.amazonaws.com/Foo/Projects/AK_Test_2020/TIFF/b.tif" \
+    | fanout_by_project "")
+  project=$(echo "${result}" | cut -f1)
+  url_file=$(echo "${result}" | cut -f2)
+  [ "${project}" = "AK_Test_2020" ]
+  [ "$(wc -l < "${url_file}")" -eq 2 ]
+}
+
+@test "fanout_by_project uses fallback for non-project URLs" {
+  WORK_DIR=$(mktemp -d); trap 'rm -rf "${WORK_DIR}"' EXIT
+  result=$(printf '%s\n' \
+    "https://example.com/no/projects/tile.tif" \
+    | fanout_by_project "_myfallback")
+  project=$(echo "${result}" | cut -f1)
+  [ "${project}" = "_myfallback" ]
+}
+
+@test "fanout_by_project drops non-project URLs when fallback is empty" {
+  WORK_DIR=$(mktemp -d); trap 'rm -rf "${WORK_DIR}"' EXIT
+  result=$(printf '%s\n' \
+    "https://example.com/no/projects/tile.tif" \
+    | fanout_by_project "")
+  [ -z "${result}" ]
+}
+
+@test "fanout_by_project splits two projects into separate entries" {
+  WORK_DIR=$(mktemp -d); trap 'rm -rf "${WORK_DIR}"' EXIT
+  result=$(printf '%s\n%s\n' \
+    "https://s3/Foo/Projects/Alpha_2020/TIFF/a.tif" \
+    "https://s3/Foo/Projects/Beta_2021/TIFF/b.tif" \
+    | fanout_by_project "")
+  count=$(echo "${result}" | wc -l)
+  [ "${count}" -eq 2 ]
+  [[ "${result}" == *"Alpha_2020"* ]]
+  [[ "${result}" == *"Beta_2021"* ]]
+}
