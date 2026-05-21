@@ -55,12 +55,10 @@ ${GIS_DIR}/lidar/
 | Command | What it does |
 |---|---|
 | `lidar run` | Download tiles, mosaic, derive shading, build outputs |
-| `lidar list` | Recent runs from the events index |
-| `lidar log <name\|hex>` | Stream (running) or page (done) a run's log |
-| `lidar size <name\|hex>` | Disk usage breakdown for a run's output |
-| `lidar kill <name\|hex\|PID>` | Stop a running pipeline (or `--all`) |
-| `lidar service install <name>` | Wrap a run as a systemd `--user` service |
-| `lidar service uninstall <name>` | Remove a service |
+| `lidar list [<hex>]` | Run table, or stream/page one run's log |
+| `lidar size <hex>` | Disk usage breakdown for a run's output |
+| `lidar kill <hex\|PID>` | Stop a running pipeline (or `--all`) |
+| `lidar restart <hex>` | Re-run a completed or failed run |
 | `lidar help` | This help |
 
 Run `lidar <subcommand> --help` for per-subcommand flags.
@@ -83,7 +81,6 @@ a UTM zone from the data centroid if geographic. Override with
 lidar                  # entrypoint dispatcher
 libexec/lidar-*        # subcommand implementations
 lib/*.sh               # shared helpers (gdal, kml, cog, download, events)
-systemd/               # systemd unit template for `lidar service`
 tests/                 # bats tests + fixtures
 docs/superpowers/      # design specs and implementation plans
 ```

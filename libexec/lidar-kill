@@ -5,7 +5,7 @@
 #   lidar kill <target> [<target>...]   kill specific tracked runs
 #                                       target = PID or run name/hex suffix
 #   lidar kill --all                    kill everything: events-tracked runs,
-#                                       lidar@*.service units, stray processes
+#                                       stray processes
 #
 # Bare PIDs are sanity-checked against the events index — refuses to kill
 # anything not currently tracked as a running lidar run. Name/hex args are
