@@ -39,15 +39,20 @@ lidar run --output cog ~/Downloads/downloadlist.txt
 lidar run --output kml,cog ~/Downloads/downloadlist.txt
 ```
 
+When a tile list spans multiple USGS projects, `lidar run` dispatches one
+independent run per project and returns immediately. Each run gets its own
+hex ID, log file, and output directory. Use `--jobs N` to cap concurrency.
+
 Outputs land under `${GIS_DIR}/lidar/`:
 
 ```
 ${GIS_DIR}/lidar/
-  tiles/dem/           # downloaded source tiles (cached, shared across runs)
-  kml/<name>/          # Google Earth super-overlay pyramid
-  kmz/<name>/          # zipped pyramid (.kmz files, one per shading×project)
-  cog/<name>/          # Cloud-Optimized GeoTIFFs (DEM + shadings) + README.md
-  logs/                # per-run log files + events index
+  tiles/dem/                        # downloaded source tiles (cached, shared across runs)
+  projects/<project>/<hex>/kml/     # Google Earth super-overlay pyramid
+  projects/<project>/<hex>/kmz/     # zipped .kmz files (one per shading×project)
+  projects/<project>/<hex>/cog/     # Cloud-Optimized GeoTIFFs + README.md
+  logs/<hex>.log                    # per-run log file
+  logs/runs.jsonl                   # events index
 ```
 
 ## Subcommands
