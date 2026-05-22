@@ -15,16 +15,16 @@ events_emit_start() {
   local id="$1" log="$2" project="$3"; shift 3
   mkdir -p "$(dirname "${EVENTS_FILE}")"
   local ts; ts=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-  local args_json="[" first=1 a
+  local urls_json="[" first=1 a
   for a in "$@"; do
-    [[ ${first} -eq 1 ]] || args_json+=","
-    args_json+="\"$(json_escape "${a}")\""
+    [[ ${first} -eq 1 ]] || urls_json+=","
+    urls_json+="\"$(json_escape "${a}")\""
     first=0
   done
-  args_json+="]"
-  printf '{"id":"%s","event":"start","ts":"%s","pid":%d,"log":"%s","project":"%s","args":%s}\n' \
+  urls_json+="]"
+  printf '{"id":"%s","event":"start","ts":"%s","pid":%d,"log":"%s","project":"%s","urls":%s}\n' \
     "$(json_escape "${id}")" "${ts}" "$$" "$(json_escape "${log}")" \
-    "$(json_escape "${project}")" "${args_json}" \
+    "$(json_escape "${project}")" "${urls_json}" \
     >> "${EVENTS_FILE}"
 }
 
@@ -49,7 +49,7 @@ cleanup_old_logs() {
 }
 
 # ─── Run ID resolver ─────────────────────────────────────────────────────────
-# Accepts a full run ID or a bare hex suffix; prints the resolved ID.
+# Accepts a full run ID or a bare hex prefix; prints the resolved ID.
 # Errors (to stderr) and returns 1 on no match or ambiguity.
 resolve_run_id() {
   local query="$1"
@@ -59,7 +59,7 @@ resolve_run_id() {
   local matches
   matches=$(jq -rs --arg q "${query}" '
     [ .[] | select(.event=="start") | .id ] | unique
-    | .[] | select(. == $q or endswith("_" + $q))
+    | .[] | select(. == $q or startswith($q))
   ' "${EVENTS_FILE}")
 
   local count=0
@@ -80,7 +80,7 @@ resolve_run_id() {
 # Accepts a tile list (local file or https:// URL), a run name, or a hex suffix.
 # Sets globals (cleared on each call):
 #   INPUT_TYPE       "tile-list" | "run"
-#   INPUT_TILE_LIST  path or URL for tile-list type; extracted from run args for run type
+#   INPUT_TILE_LIST  path or URL for tile-list type; extracted from run urls for run type
 #   INPUT_RUN_ID     resolved run ID for run type; empty for tile-list type
 # Returns 0 on success, 1 with an error message on stderr on failure.
 resolve_input() {
@@ -103,10 +103,8 @@ resolve_input() {
   if id=$(resolve_run_id "${arg}" 2>/dev/null); then
     INPUT_TYPE="run"
     INPUT_RUN_ID="${id}"
-    # First non-flag positional in the stored args is the tile list path/URL.
     INPUT_TILE_LIST=$(jq -rs --arg id "${id}" '
-      .[] | select(.id == $id and .event == "start") | .args
-      | map(select(startswith("-") | not)) | first // ""
+      .[] | select(.id == $id and .event == "start") | .urls[0] // ""
     ' "${EVENTS_FILE}" 2>/dev/null || echo "")
     return 0
   fi
@@ -116,53 +114,11 @@ resolve_input() {
   return 1
 }
 
-# ─── Restart arg reconstruction ──────────────────────────────────────────────
-# Given a run ID, emit the args to use for a restart — one arg per line.
-# --background/-b is stripped (the caller adds it). --name/-n is stripped and
-# re-emitted with an incremented suffix: foo → foo_2, foo_2 → foo_3. If the
-# run had no --name, none is emitted (lets lidar-run generate a fresh one).
-strip_restart_flags() {
-  local id="$1"
-
-  local orig_name
-  orig_name=$(jq -rs --arg id "$id" '
-    [ .[] | select(.id==$id and .event=="start") ] | last | .args // []
-    | . as $a
-    | [ range(length) | . as $i
-        | if ($a[$i] == "--name" or $a[$i] == "-n") then $a[$i+1] // empty
-          else empty
-          end ] | first // ""
-  ' "${EVENTS_FILE}")
-
-  jq -rs --arg id "$id" '
-    [ .[] | select(.id==$id and .event=="start") ] | last | .args // []
-    | . as $a
-    | [ range(length) | . as $i
-        | if $a[$i] == "--background" or $a[$i] == "-b" then empty
-          elif ($a[$i] == "--name" or $a[$i] == "-n") then empty
-          elif $i > 0 and ($a[$i-1] == "--name" or $a[$i-1] == "-n") then empty
-          else $a[$i]
-          end ]
-    | .[]
-  ' "${EVENTS_FILE}"
-
-  if [[ -n "${orig_name}" ]]; then
-    local new_name
-    if [[ "${orig_name}" =~ ^(.+)_([0-9]+)$ ]]; then
-      new_name="${BASH_REMATCH[1]}_$(( BASH_REMATCH[2] + 1 ))"
-    else
-      new_name="${orig_name}_2"
-    fi
-    echo "--name"
-    echo "${new_name}"
-  fi
-}
-
 # ─── --list-runs implementation ──────────────────────────────────────────────
 # Renders all recorded runs (newest-first) as a text table to stdout.
 list_runs() {
   command -v jq >/dev/null || {
-    echo "ERROR: list_runs requires jq (sudo dnf install jq)" >&2
+    echo "ERROR: list_runs requires jq" >&2
     exit 1
   }
   if [[ ! -f "${EVENTS_FILE}" ]]; then
@@ -170,22 +126,22 @@ list_runs() {
     return
   fi
 
-  # jq collapses events to per-id rows: id, started, ended, pid, log, exit, last_event, duration_sec
-  # Sorted newest-first. Fields joined by ASCII US (0x1F) — non-whitespace, so
-  # bash IFS preserves empty fields (tabs collapse under default whitespace IFS).
-  # duration_sec is computed in jq: if ended exists, use (ended - started), else (now - started).
+  # jq collapses events to per-id rows. Fields joined by ASCII US (0x1F) —
+  # non-whitespace, so bash IFS preserves empty fields.
+  # duration_sec: if ended exists, use (ended - started), else (now - started).
   local rows
   rows=$(jq -s -r '
     group_by(.id) | map(
       (map(select(.event=="start"))[0]) as $s
       | .[-1] as $last
       | {
-          id: ($s.id // $last.id),
-          started: ($s.ts // ""),
-          ended: (if $last.event=="end" then $last.ts else "" end),
-          pid: ($s.pid // 0),
-          log: ($s.log // ""),
-          exit: (if $last.event=="end" then $last.exit else null end),
+          id:       ($s.id // $last.id),
+          project:  ($s.project // ""),
+          started:  ($s.ts // ""),
+          ended:    (if $last.event=="end" then $last.ts else "" end),
+          pid:      ($s.pid // 0),
+          log:      ($s.log // ""),
+          exit:     (if $last.event=="end" then $last.exit else null end),
           last_event: $last.event,
           duration_sec: (
             if (if $last.event=="end" then $last.ts else "" end) != "" then
@@ -197,7 +153,7 @@ list_runs() {
           )
         }
     ) | sort_by(.started) | reverse
-    | .[] | [.id, .started, .ended, (.pid|tostring), .log,
+    | .[] | [.id, .project, .started, .ended, (.pid|tostring), .log,
              (.exit // "" | tostring), .last_event, (.duration_sec|tostring)] | join("")
   ' "${EVENTS_FILE}")
 
@@ -205,14 +161,14 @@ list_runs() {
   local C_RESET="" C_OK="" C_FAIL="" C_RUN="" C_CRASH=""
   if [[ -t 1 ]]; then
     C_RESET=$'\033[0m'
-    C_OK=$'\033[32m'     # green
-    C_FAIL=$'\033[31m'   # red
-    C_RUN=$'\033[33m'    # yellow
-    C_CRASH=$'\033[35m'  # magenta
+    C_OK=$'\033[32m'
+    C_FAIL=$'\033[31m'
+    C_RUN=$'\033[33m'
+    C_CRASH=$'\033[35m'
   fi
 
-  printf "%-9s  %-19s  %9s  %-24s  %s\n" "STATUS" "STARTED" "DURATION" "NAME" "LOG"
-  while IFS=$'\x1f' read -r id started ended pid log exit_code last_event duration_sec; do
+  printf "%-8s  %-6s  %-19s  %9s  %s\n" "STATUS" "HEX" "STARTED" "DURATION" "PROJECT"
+  while IFS=$'\x1f' read -r id project started ended pid log exit_code last_event duration_sec; do
     [[ -z "${id}" ]] && continue
     local status
     if [[ "${last_event}" == "end" ]]; then
@@ -237,8 +193,7 @@ list_runs() {
     # 2026-05-16T22:14:03Z → 2026-05-16 22:14:03
     local started_h="${started/T/ }"; started_h="${started_h%Z}"
     local dur_h; dur_h=$(human_duration "${duration_sec}")
-    local log_base="${log##*/}"
-    printf "${color}%-9s${C_RESET}  %-19s  %9s  %-24s  %s\n" \
-      "${sym}" "${started_h}" "${dur_h}" "${id}" "${log_base}"
+    printf "${color}%-8s${C_RESET}  %-6s  %-19s  %9s  %s\n" \
+      "${sym}" "${id}" "${started_h}" "${dur_h}" "${project}"
   done <<< "${rows}"
 }
