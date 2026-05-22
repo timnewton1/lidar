@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # `lidar run` — download USGS lidar tiles and produce KML/KMZ/COG outputs.
 #
-# Usage: lidar run [options] <downloadlist.txt|URL> [<downloadlist.txt|URL>...]
+# Usage: lidar run [options] <list.txt|URL> [<list.txt|URL>...]
+#
+# Each positional is a local .txt tile list or a bare tile https:// URL.
+# When the list spans multiple USGS projects, one independent run is
+# dispatched per project. Runs execute concurrently (bounded by --jobs)
+# and are detached; the command returns immediately after dispatch.
 #
 # Options:
 #   -s, --shading LIST       comma-separated shadings (default: hillshade)
@@ -10,12 +15,13 @@
 #                            Horn is the safer default for noisy lidar DEMs.
 #   -m, --multidirectional   use gdaldem -multidirectional (USGS's choice);
 #                            otherwise -combined with az=315 alt=45.
+#   -j, --jobs N             max concurrent project runs (default: auto)
 #   -g, --gis-dir PATH       override GIS_DIR for this run
 #   -o, --output OUTPUTS     comma-separated outputs (default: kml).
 #                            Known: kml, kmz, cog.
 #                              kml — Google Earth super-overlay tile pyramid
 #                              kmz — kml + zipped .kmz (auto-enables kml)
-#                              cog — Cloud-Optimized GeoTIFFs into cog/<name>/
+#                              cog — Cloud-Optimized GeoTIFFs (no KML pyramid)
 #                            'cog' without 'kml' is dramatically faster —
 #                            skips the WGS84 reproject and tile pyramid steps.
 #       --cog-crs EPSG:NNNN  reproject COG output to this CRS (default: source
@@ -28,12 +34,11 @@
 source "${LIDAR_HOME}/lib/strict.sh"
 
 usage() {
-  sed -n '3,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '3,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-1}"
 }
 
 SHADINGS_CSV="hillshade"
-NAME=""
 OUTPUTS_CSV=""
 COG_CRS=""
 COG_NO_REPROJECT=0
@@ -41,25 +46,23 @@ GIS_DIR_OVERRIDE=""
 INPUTS=()
 ALGORITHM=""
 MULTIDIRECTIONAL=0
-BACKGROUND=0
+JOBS_OVERRIDE=""
 DRY_RUN=0
-ORIG_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -s|--shading)         SHADINGS_CSV="$2"; shift 2 ;;
-    -a|--algorithm)       ALGORITHM="$2"; shift 2 ;;
+    -s|--shading)          SHADINGS_CSV="$2"; shift 2 ;;
+    -a|--algorithm)        ALGORITHM="$2"; shift 2 ;;
     -m|--multidirectional) MULTIDIRECTIONAL=1; shift ;;
-    -n|--name)            NAME="$2"; shift 2 ;;
-    -g|--gis-dir)         GIS_DIR_OVERRIDE="$2"; shift 2 ;;
-    -o|--output)          OUTPUTS_CSV="$2"; shift 2 ;;
-    --cog-crs)            COG_CRS="$2"; shift 2 ;;
-    --cog-no-reproject)   COG_NO_REPROJECT=1; shift ;;
-    -b|--background)      BACKGROUND=1; shift ;;
-    -d|--dry-run)         DRY_RUN=1; shift ;;
-    -h|--help)            usage 0 ;;
-    -*)                   echo "Unknown flag: $1" >&2; usage ;;
-    *)  INPUTS+=("$1"); shift ;;
+    -j|--jobs)             JOBS_OVERRIDE="$2"; shift 2 ;;
+    -g|--gis-dir)          GIS_DIR_OVERRIDE="$2"; shift 2 ;;
+    -o|--output)           OUTPUTS_CSV="$2"; shift 2 ;;
+    --cog-crs)             COG_CRS="$2"; shift 2 ;;
+    --cog-no-reproject)    COG_NO_REPROJECT=1; shift ;;
+    -d|--dry-run)          DRY_RUN=1; shift ;;
+    -h|--help)             usage 0 ;;
+    -*)                    echo "Unknown flag: $1" >&2; usage ;;
+    *)                     INPUTS+=("$1"); shift ;;
   esac
 done
 
@@ -101,6 +104,13 @@ if [[ -n "${COG_CRS}" && ${COG_NO_REPROJECT} -eq 1 ]]; then
   exit 1
 fi
 
+# ─── Validate --jobs ─────────────────────────────────────────────────────────
+if [[ -n "${JOBS_OVERRIDE}" ]]; then
+  [[ "${JOBS_OVERRIDE}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ERROR: --jobs must be a positive integer (got: ${JOBS_OVERRIDE})" >&2; exit 1
+  }
+fi
+
 [[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
 
 source "${LIDAR_HOME}/lib/common.sh"
@@ -111,41 +121,6 @@ source "${LIDAR_HOME}/lib/kml.sh"
 source "${LIDAR_HOME}/lib/cog.sh"
 
 [[ ${#INPUTS[@]} -eq 0 ]] && usage
-
-# ─── --background: re-exec detached, log to file, print PID, exit ────────────
-if [[ ${BACKGROUND} -eq 1 ]]; then
-  CHILD_ARGS=()
-  for a in "${ORIG_ARGS[@]}"; do
-    [[ "${a}" == "--background" || "${a}" == "-b" ]] && continue
-    CHILD_ARGS+=("${a}")
-  done
-  EFFECTIVE_GIS_DIR="${GIS_DIR_OVERRIDE:-${GIS_DIR:-}}"
-  [[ -z "${EFFECTIVE_GIS_DIR}" ]] && { echo "ERROR: GIS_DIR not set" >&2; exit 1; }
-  LOG_DIR="${EFFECTIVE_GIS_DIR}/lidar/logs"
-  mkdir -p "${LOG_DIR}"
-  if [[ -n "${NAME}" ]]; then
-    LOG_NAME="${NAME}"
-    LOG_FILE="${LOG_DIR}/${LOG_NAME}.log"
-    if [[ -e "${LOG_FILE}" ]]; then
-      echo "ERROR: log file already exists: ${LOG_FILE}" >&2
-      echo "  Use --name to disambiguate." >&2
-      exit 1
-    fi
-  else
-    LOG_NAME=$(gen_run_name "${LOG_DIR}" ".log")
-    LOG_FILE="${LOG_DIR}/${LOG_NAME}.log"
-    # Pass the generated name to the child so run ID == log filename.
-    CHILD_ARGS+=(--name "${LOG_NAME}")
-  fi
-  echo "Starting in background..."
-  echo "  Log : ${LOG_FILE}"
-  nohup "${LIDAR_HOME}/lidar" run "${CHILD_ARGS[@]}" >"${LOG_FILE}" 2>&1 </dev/null &
-  CHILD_PID=$!
-  echo "  PID : ${CHILD_PID}"
-  echo "  (tracked in events index — see: lidar log)"
-  disown
-  exit 0
-fi
 
 # ─── Combine all inputs into one URL stream ──────────────────────────────────
 COMBINED_LIST=$(mktemp "${LIDAR_DIR}/.combined_XXXXXX.txt")
@@ -167,7 +142,11 @@ for _inp in "${INPUTS[@]}"; do
     grep -i '\.tif' "${_inp}" | grep -v '^#' | grep -v '^[[:space:]]*$' >> "${COMBINED_LIST}" || true
   fi
 done
-DOWNLOAD_LIST="${COMBINED_LIST}"
+
+if [[ ! -s "${COMBINED_LIST}" ]]; then
+  echo "ERROR: No .tif URLs found in inputs: ${INPUTS[*]}" >&2
+  exit 1
+fi
 
 # ─── Parse + validate shadings ───────────────────────────────────────────────
 IFS=',' read -r -a SHADINGS <<< "${SHADINGS_CSV}"
@@ -188,331 +167,373 @@ if [[ -n "${ALGORITHM}" ]]; then
 fi
 [[ ${MULTIDIRECTIONAL} -eq 1 ]] && HS_MULTIDIRECTIONAL=1
 
-KML_DIR="${LIDAR_DIR}/kml"
-
-if [[ -z "${NAME}" ]]; then
-  NAME=$(gen_run_name "${KML_DIR}")
-fi
-
-OUT_DIR="${KML_DIR}/${NAME}"
-COG_DIR="${LIDAR_DIR}/cog/${NAME}"
-
-if [[ ${OUTPUT_KML} -eq 1 && -e "${OUT_DIR}" && ${DRY_RUN} -eq 0 ]]; then
-  echo "ERROR: output directory already exists: ${OUT_DIR}" >&2
-  echo "  Choose a different --name or remove the existing directory." >&2
-  exit 1
-fi
-if [[ ${OUTPUT_COG} -eq 1 && -e "${COG_DIR}" && ${DRY_RUN} -eq 0 ]]; then
-  echo "ERROR: COG output directory already exists: ${COG_DIR}" >&2
-  echo "  Choose a different --name or remove the existing directory." >&2
-  exit 1
-fi
-
 extra_deps=()
 [[ ${OUTPUT_KMZ} -eq 1 ]] && extra_deps+=(zip)
 [[ ${OUTPUT_COG} -eq 1 ]] && extra_deps+=(python3)
 
-# ─── --dry-run: validate inputs and print plan ───────────────────────────────
+# ─── Fan-out by project ───────────────────────────────────────────────────────
+WORK_DIR=$(mktemp -d "${LIDAR_DIR}/.work_XXXXXX")
+
+_FALLBACK_PROJECT=""
+if [[ "${INPUTS[0]}" != *'://'* ]]; then
+  _FALLBACK_PROJECT="_$(basename "${INPUTS[0]}" .txt)"
+fi
+
+_FANOUT_TSV="${WORK_DIR}/fanout.tsv"
+fanout_by_project "${_FALLBACK_PROJECT}" < "${COMBINED_LIST}" > "${_FANOUT_TSV}"
+
+if [[ ! -s "${_FANOUT_TSV}" ]]; then
+  echo "ERROR: no URL groups found — are URLs in USGS Projects/<name>/ format?" >&2
+  exit 1
+fi
+
+mapfile -t _FANOUT_PROJECTS < <(cut -f1 "${_FANOUT_TSV}")
+mapfile -t _FANOUT_URLFILES < <(cut -f2 "${_FANOUT_TSV}")
+_N_PROJECTS="${#_FANOUT_PROJECTS[@]}"
+
+# ─── --dry-run: print fan-out plan and exit ───────────────────────────────────
 if [[ ${DRY_RUN} -eq 1 ]]; then
-  WORK_DIR=$(mktemp -d "${LIDAR_DIR}/.work_XXXXXX")
-  trap 'rm -rf "${WORK_DIR}"' EXIT
-  check_deps_and_input "${DOWNLOAD_LIST}" "${extra_deps[@]+"${extra_deps[@]}"}"
   OUTPUTS_PLAN=""
   [[ ${OUTPUT_KML} -eq 1 ]] && OUTPUTS_PLAN+="kml "
   [[ ${OUTPUT_KMZ} -eq 1 ]] && OUTPUTS_PLAN+="kmz "
   [[ ${OUTPUT_COG} -eq 1 ]] && OUTPUTS_PLAN+="cog "
-  if [[ ${OUTPUT_COG} -eq 1 ]]; then
-    if [[ -n "${COG_CRS}" ]]; then
-      COG_CRS_PLAN="${COG_CRS} (explicit)"
-    elif [[ ${COG_NO_REPROJECT} -eq 1 ]]; then
-      COG_CRS_PLAN="native (no-reproject)"
-    else
-      COG_CRS_PLAN="auto (source CRS if projected; else UTM)"
-    fi
-  fi
+
   echo "=== DRY RUN PLAN ==="
-  echo "Name        : ${NAME}"
+  echo "Inputs      : ${INPUTS[*]}"
+  echo "Projects    : ${_N_PROJECTS}"
+  echo "Jobs        : ${JOBS_OVERRIDE:-auto}"
   echo "Shadings    : ${SHADINGS[*]}"
   echo "Algorithm   : ${HS_ALGORITHM} (multidirectional=${HS_MULTIDIRECTIONAL})"
   echo "Outputs     : ${OUTPUTS_PLAN% }"
-  [[ ${OUTPUT_KML} -eq 1 ]] && echo "KML dir     : ${OUT_DIR}"
-  [[ ${OUTPUT_COG} -eq 1 ]] && echo "COG dir     : ${COG_DIR}"
-  [[ ${OUTPUT_COG} -eq 1 ]] && echo "COG CRS     : ${COG_CRS_PLAN}"
-  echo "Inputs      : ${INPUTS[*]}"
-  echo "Tile count  : ${TOTAL_TILES}"
-  echo "GIS_DIR     : ${GIS_DIR}"
-  exit 0
-fi
-
-# ─── Single-instance lock (per --name) ───────────────────────────────────────
-LOCK_DIR="${LIDAR_DIR}/locks"
-mkdir -p "${LOCK_DIR}"
-LOCK_FILE="${LOCK_DIR}/${NAME}.lock"
-exec {LOCK_FD}>"${LOCK_FILE}"
-if ! flock -n "${LOCK_FD}"; then
-  HOLDER=$(cat "${LOCK_FILE}" 2>/dev/null || true)
-  echo "Another instance is already running (lock ${LOCK_FILE}${HOLDER:+, PID ${HOLDER}})"
-  exit 0
-fi
-echo $$ > "${LOCK_FILE}"
-
-# ─── Events: emit 'start' now and 'end' on exit ──────────────────────────────
-EVENT_LOG_PATH=""
-if [[ ! -t 1 ]]; then
-  # Use $$ (parent shell PID) not /proc/self — $() subshell replaces fd/1 with a pipe.
-  EVENT_LOG_PATH=$(readlink -f "/proc/$$/fd/1" 2>/dev/null || true)
-  [[ "${EVENT_LOG_PATH}" == /dev/* ]] && EVENT_LOG_PATH=""
-fi
-events_emit_start "${NAME}" "${EVENT_LOG_PATH}" "" "${ORIG_ARGS[@]}"
-
-# Gate on available RAM before doing any real work. GDAL's own default cache
-# is 5% of usable RAM per job, so wait for that much headroom — this naturally
-# queues concurrent jobs without needing a separate queue command.
-_mem_total_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
-_need_kb=$(( _mem_total_kb * GDAL_CACHE_PCT / 100 ))
-while (( $(awk '/MemAvailable/{print $2}' /proc/meminfo) < _need_kb )); do
-  echo "Waiting for $(( _need_kb / 1024 )) MB headroom..."
-  sleep 10
-done
-unset _need_kb _mem_total_kb
-
-WORK_DIR=$(mktemp -d "${LIDAR_DIR}/.work_XXXXXX")
-
-on_exit() {
-  local rc=$?
-  events_emit_end "${NAME}" "${rc}"
-  [[ -n "${WORK_DIR:-}" ]] && rm -rf "${WORK_DIR}"
-  rm -f "${COMBINED_LIST:-}"
-}
-# When bash is signaled mid-wait, $? in the EXIT trap reads as 0 even though
-# the process exits 128+N — so killed runs were getting recorded as success.
-# Re-raise the signal via exit(128+N) so the EXIT trap sees the real status.
-on_signal() { exit "$(( 128 + $(kill -l "$1") ))"; }
-trap 'on_signal TERM' TERM
-trap 'on_signal INT'  INT
-trap 'on_signal HUP'  HUP
-trap on_exit EXIT
-
-cleanup_old_logs 30
-
-check_deps_and_input "${DOWNLOAD_LIST}" "${extra_deps[@]+"${extra_deps[@]}"}"
-LISTS_DIR="${WORK_DIR}/project_lists"
-prescan
-make_dirs "${KML_DIR}"
-download_tiles
-
-# ─── Step 5: Materialize per-project tile-file lists ─────────────────────────
-echo "=========================================="
-echo "STEP 5: Resolving downloaded tiles by project"
-echo "=========================================="
-
-MISSING=0
-declare -A PROJECT_READY=()
-READY_PROJECTS=()
-for PROJECT in "${PROJECT_NAMES[@]}"; do
-  URLS_FILE="${LISTS_DIR}/${PROJECT}.urls"
-  LIST_FILE="${LISTS_DIR}/${PROJECT}.list"
-  : > "${LIST_FILE}"
-  N=0
-  while IFS= read -r URL; do
-    [[ -z "${URL}" ]] && continue
-    BASENAME="${URL##*/}"; BASENAME="${BASENAME%.tif}"
-    TILE_TIF="${DEM_DIR}/${BASENAME}.tif"
-    if [[ -f "${TILE_TIF}" ]]; then
-      echo "${TILE_TIF}" >> "${LIST_FILE}"
-      N=$((N + 1))
+  if [[ ${OUTPUT_COG} -eq 1 ]]; then
+    if [[ -n "${COG_CRS}" ]]; then
+      echo "COG CRS     : ${COG_CRS} (explicit)"
+    elif [[ ${COG_NO_REPROJECT} -eq 1 ]]; then
+      echo "COG CRS     : native (no-reproject)"
     else
-      MISSING=$((MISSING + 1))
+      echo "COG CRS     : auto (source CRS if projected; else UTM)"
     fi
-  done < "${URLS_FILE}"
-  PROJECT_READY["${PROJECT}"]="${N}"
-  [[ ${N} -gt 0 ]] && READY_PROJECTS+=("${PROJECT}")
-done
-PROJECT_NAMES=("${READY_PROJECTS[@]}")
-
-if [[ ${#PROJECT_NAMES[@]} -eq 0 ]]; then
-  echo "ERROR: no DEM tiles available to mosaic (${MISSING} missing)"
-  exit 1
+  fi
+  echo ""
+  for (( _i=0; _i<_N_PROJECTS; _i++ )); do
+    _proj="${_FANOUT_PROJECTS[_i]}"
+    _cnt=$(wc -l < "${_FANOUT_URLFILES[_i]}" 2>/dev/null || echo 0)
+    printf "  [%d/%d] %-50s  %d URL(s)\n" "$((_i+1))" "${_N_PROJECTS}" "${_proj}" "${_cnt}"
+  done
+  rm -rf "${WORK_DIR}"
+  exit 0
 fi
 
-echo "  Projects ready: ${#PROJECT_NAMES[@]}  (${MISSING} missing tiles)"
-for PROJECT in "${PROJECT_NAMES[@]}"; do
-  printf "    %-60s %5d tiles\n" "${PROJECT}" "${PROJECT_READY[${PROJECT}]}"
-done
-
-# ─── Step 6: Per-shading × per-project shading derivation + KML pyramid ──────
-echo "=========================================="
-if [[ ${OUTPUT_KML} -eq 1 ]]; then
-  echo "STEP 6: Deriving shadings + generating KML tile pyramids (${#SHADINGS[@]} shading(s) × ${#PROJECT_NAMES[@]} project(s))"
+# ─── Compute job parallelism ─────────────────────────────────────────────────
+if [[ -n "${JOBS_OVERRIDE}" ]]; then
+  JOBS="${JOBS_OVERRIDE}"
 else
-  echo "STEP 6: Deriving shadings (${#SHADINGS[@]} shading(s) × ${#PROJECT_NAMES[@]} project(s)) — KML pyramid skipped"
+  _ncpu=$(nproc)
+  _ram_gb=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
+  JOBS=$(( _ncpu / 2 ))
+  (( _ram_gb / 2 < JOBS )) && JOBS=$(( _ram_gb / 2 ))
+  (( _N_PROJECTS < JOBS )) && JOBS="${_N_PROJECTS}"
+  (( JOBS < 1 )) && JOBS=1
 fi
-echo "=========================================="
 
-[[ ${OUTPUT_KML} -eq 1 ]] && mkdir -p "${OUT_DIR}"
+# ─── Per-project pipeline ─────────────────────────────────────────────────────
+# Receives project name, hex run ID, and URL file path.
+# Runs the full pipeline in its own WORK_DIR, logging to its own log file.
+# All flag variables (OUTPUT_KML, SHADINGS, etc.) inherited from parent scope.
+_run_one_project() {
+  local _project="$1" _hex="$2" _url_file_src="$3"
 
-# Build per-project DEM VRTs once; reuse across shadings (and COG).
-declare -A DEM_VRT=()
-for PROJECT in "${PROJECT_NAMES[@]}"; do
-  VRT="${WORK_DIR}/${PROJECT}_dem.vrt"
-  build_dem_vrt "${LISTS_DIR}/${PROJECT}.list" "${VRT}"
-  DEM_VRT["${PROJECT}"]="${VRT}"
-done
+  local _log_dir="${LIDAR_DIR}/logs"
+  local _log="${_log_dir}/${_hex}.log"
+  mkdir -p "${_log_dir}"
+  exec > "${_log}" 2>&1
 
-for SHADING in "${SHADINGS[@]}"; do
-  if [[ ${OUTPUT_KML} -eq 1 ]]; then
-    SHADING_DIR="${OUT_DIR}/${SHADING}"
-    mkdir -p "${SHADING_DIR}"
+  local _proj_work; _proj_work=$(mktemp -d "${LIDAR_DIR}/.work_XXXXXX")
+  WORK_DIR="${_proj_work}"
+
+  # Copy url_file into private WORK_DIR before the parent's temp dir is removed.
+  local _url_file="${_proj_work}/input.urls"
+  cp "${_url_file_src}" "${_url_file}"
+
+  local _on_exit_done=0
+  _on_project_exit() {
+    [[ ${_on_exit_done} -eq 1 ]] && return; _on_exit_done=1
+    local _rc=$?
+    events_emit_end "${_hex}" "${_rc}"
+    rm -rf "${_proj_work}"
+  }
+  _on_project_signal() { exit "$(( 128 + $(kill -l "$1") ))"; }
+  trap '_on_project_signal TERM' TERM
+  trap '_on_project_signal INT'  INT
+  trap '_on_project_signal HUP'  HUP
+  trap _on_project_exit EXIT
+
+  # Gate on available RAM. GDAL's own default cache is 5% of usable RAM per
+  # job, so wait for that much headroom — naturally queues concurrent jobs.
+  local _mem_total_kb; _mem_total_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+  local _need_kb=$(( _mem_total_kb * GDAL_CACHE_PCT / 100 ))
+  while (( $(awk '/MemAvailable/{print $2}' /proc/meminfo) < _need_kb )); do
+    echo "Waiting for $(( _need_kb / 1024 )) MB headroom..."
+    sleep 10
+  done
+
+  cleanup_old_logs 30
+
+  LISTS_DIR="${_proj_work}/project_lists"
+  mkdir -p "${LISTS_DIR}"
+
+  # Tell prescan which project bucket to use for non-Projects/ URLs.
+  export FANOUT_PROJECT="${_project}"
+
+  check_deps_and_input "${_url_file}" "${extra_deps[@]+"${extra_deps[@]}"}"
+  prescan
+  make_dirs "${PROJECTS_DIR}/${_project}/${_hex}"
+  download_tiles
+
+  # ── Step 5: resolve downloaded tiles ────────────────────────────────────────
+  echo "=========================================="
+  echo "STEP 5: Resolving downloaded tiles by project"
+  echo "=========================================="
+
+  local MISSING=0
+  declare -A PROJECT_READY=()
+  local READY_PROJECTS=()
+  local PROJECT
+  for PROJECT in "${PROJECT_NAMES[@]}"; do
+    local URLS_FILE="${LISTS_DIR}/${PROJECT}.urls"
+    local LIST_FILE="${LISTS_DIR}/${PROJECT}.list"
+    : > "${LIST_FILE}"
+    local N=0
+    local URL BASENAME TILE_TIF
+    while IFS= read -r URL; do
+      [[ -z "${URL}" ]] && continue
+      BASENAME="${URL##*/}"; BASENAME="${BASENAME%.tif}"
+      TILE_TIF="${DEM_DIR}/${BASENAME}.tif"
+      if [[ -f "${TILE_TIF}" ]]; then
+        echo "${TILE_TIF}" >> "${LIST_FILE}"
+        N=$((N + 1))
+      else
+        MISSING=$((MISSING + 1))
+      fi
+    done < "${URLS_FILE}"
+    PROJECT_READY["${PROJECT}"]="${N}"
+    [[ ${N} -gt 0 ]] && READY_PROJECTS+=("${PROJECT}")
+  done
+  PROJECT_NAMES=("${READY_PROJECTS[@]}")
+
+  if [[ ${#PROJECT_NAMES[@]} -eq 0 ]]; then
+    echo "ERROR: no DEM tiles available to mosaic (${MISSING} missing)"
+    exit 1
   fi
 
+  echo "  Projects ready: ${#PROJECT_NAMES[@]}  (${MISSING} missing tiles)"
   for PROJECT in "${PROJECT_NAMES[@]}"; do
-    SHADE_TIF="${WORK_DIR}/${SHADING}_${PROJECT}.tif"
+    printf "    %-60s %5d tiles\n" "${PROJECT}" "${PROJECT_READY[${PROJECT}]}"
+  done
 
-    echo "------------------------------------------"
-    echo "${SHADING} / ${PROJECT}  (${PROJECT_COUNT[${PROJECT}]} tiles)"
-    echo "------------------------------------------"
+  # ── Output dirs for this run ─────────────────────────────────────────────────
+  local _run_root="${PROJECTS_DIR}/${_project}/${_hex}"
+  local OUT_DIR="${_run_root}/kml"
+  local COG_DIR="${_run_root}/cog"
+  local KMZ_DIR="${_run_root}/kmz"
 
-    echo "  Deriving ${SHADING}..."
-    derive_shading "${SHADING}" "${DEM_VRT[${PROJECT}]}" "${SHADE_TIF}"
+  # ── Step 6: shading derivation + KML tile pyramids ──────────────────────────
+  echo "=========================================="
+  if [[ ${OUTPUT_KML} -eq 1 ]]; then
+    echo "STEP 6: Deriving shadings + generating KML tile pyramids (${#SHADINGS[@]} shading(s) × ${#PROJECT_NAMES[@]} project(s))"
+  else
+    echo "STEP 6: Deriving shadings (${#SHADINGS[@]} shading(s) × ${#PROJECT_NAMES[@]} project(s)) — KML pyramid skipped"
+  fi
+  echo "=========================================="
 
-    if [[ ${OUTPUT_KML} -eq 1 ]]; then
-      PROJ_OUT="${SHADING_DIR}/${PROJECT}"
-      WGS84_TIF=$(mktemp --suffix=_wgs84.tif)
-      mkdir -p "${PROJ_OUT}"
+  [[ ${OUTPUT_KML} -eq 1 ]] && mkdir -p "${OUT_DIR}"
 
-      echo "  Reprojecting to WGS84..."
-      reproject_to_wgs84 "${SHADE_TIF}" "${WGS84_TIF}"
+  declare -A DEM_VRT=()
+  for PROJECT in "${PROJECT_NAMES[@]}"; do
+    local VRT="${_proj_work}/${PROJECT}_dem.vrt"
+    build_dem_vrt "${LISTS_DIR}/${PROJECT}.list" "${VRT}"
+    DEM_VRT["${PROJECT}"]="${VRT}"
+  done
 
-      echo "  Building tile pyramid..."
-      # min-zoom=0: gdal's auto-pick is "data fits in ~1 tile" which lands
-      # at zoom 7-8 for county-sized data. Tiles that small (≤1° on a side)
-      # fall under Google Earth's default 128-px LOD threshold at typical
-      # viewing altitudes, so the overlay stays invisible until you zoom
-      # deep in. Forcing min-zoom=0 produces overview tiles that span tens
-      # of degrees — easily clearing the LOD threshold at any altitude.
-      # --skip-blank drops the mostly-empty overview tiles for small data
-      # (PNG transparency compresses to ~nothing anyway), so storage cost
-      # is a handful of extra tiles per super-overlay.
-      #
-      # max-zoom explicit: gdal's auto-pick rounds down by one for sub-
-      # meter data (OSGeo/gdal#2799, #3460), so we still compute it.
-      # cubic resampling preserves alpha-edge fidelity; average bled
-      # nodata into neighbors across overview levels and produced halos.
-      { read -r MAX_ZOOM; read -r LK_LON LK_LAT LK_RANGE; } \
-        < <(compute_zoom_and_lookat "${WGS84_TIF}") || true
-      echo "  Zoom range: 0-${MAX_ZOOM} (min=world, max=native resolution)"
-      "${GDAL[@]}" raster tile \
-        --tiling-scheme WorldCRS84Quad \
-        --kml \
-        --webviewer none \
-        --min-zoom 0 \
-        --max-zoom "${MAX_ZOOM}" \
-        -r cubic \
-        --overview-resampling cubic \
-        --skip-blank \
-        --title "${PROJECT}" \
-        -j ALL_CPUS \
-        "${WGS84_TIF}" "${PROJ_OUT}"
+  local SHADING
+  for SHADING in "${SHADINGS[@]}"; do
+    local SHADING_DIR="${OUT_DIR}/${SHADING}"
+    [[ ${OUTPUT_KML} -eq 1 ]] && mkdir -p "${SHADING_DIR}"
 
-      # Inject <LookAt> so Google Earth focuses on the actual data instead
-      # of the union of world-spanning overview tile bounds.
-      if [[ -f "${PROJ_OUT}/doc.kml" ]]; then
-        if [[ -n "${LK_LON:-}" ]]; then
-          inject_lookat "${PROJ_OUT}/doc.kml" "${LK_LON}" "${LK_LAT}" "${LK_RANGE}"
-          echo "  LookAt: ${LK_LON}, ${LK_LAT} @ ${LK_RANGE}m"
+    for PROJECT in "${PROJECT_NAMES[@]}"; do
+      local SHADE_TIF="${_proj_work}/${SHADING}_${PROJECT}.tif"
+
+      echo "------------------------------------------"
+      echo "${SHADING} / ${PROJECT}  (${PROJECT_COUNT[${PROJECT}]} tiles)"
+      echo "------------------------------------------"
+
+      echo "  Deriving ${SHADING}..."
+      derive_shading "${SHADING}" "${DEM_VRT[${PROJECT}]}" "${SHADE_TIF}"
+
+      if [[ ${OUTPUT_KML} -eq 1 ]]; then
+        local PROJ_OUT="${SHADING_DIR}/${PROJECT}"
+        local WGS84_TIF; WGS84_TIF=$(mktemp --suffix=_wgs84.tif)
+        mkdir -p "${PROJ_OUT}"
+
+        echo "  Reprojecting to WGS84..."
+        reproject_to_wgs84 "${SHADE_TIF}" "${WGS84_TIF}"
+
+        echo "  Building tile pyramid..."
+        # min-zoom=0: gdal's auto-pick is "data fits in ~1 tile" which lands
+        # at zoom 7-8 for county-sized data. Tiles that small (≤1° on a side)
+        # fall under Google Earth's default 128-px LOD threshold at typical
+        # viewing altitudes, so the overlay stays invisible until you zoom
+        # deep in. Forcing min-zoom=0 produces overview tiles that span tens
+        # of degrees — easily clearing the LOD threshold at any altitude.
+        # --skip-blank drops the mostly-empty overview tiles for small data
+        # (PNG transparency compresses to ~nothing anyway), so storage cost
+        # is a handful of extra tiles per super-overlay.
+        #
+        # max-zoom explicit: gdal's auto-pick rounds down by one for sub-
+        # meter data (OSGeo/gdal#2799, #3460), so we still compute it.
+        # cubic resampling preserves alpha-edge fidelity; average bled
+        # nodata into neighbors across overview levels and produced halos.
+        local MAX_ZOOM LK_LON LK_LAT LK_RANGE
+        { read -r MAX_ZOOM; read -r LK_LON LK_LAT LK_RANGE; } \
+          < <(compute_zoom_and_lookat "${WGS84_TIF}") || true
+        echo "  Zoom range: 0-${MAX_ZOOM} (min=world, max=native resolution)"
+        "${GDAL[@]}" raster tile \
+          --tiling-scheme WorldCRS84Quad \
+          --kml \
+          --webviewer none \
+          --min-zoom 0 \
+          --max-zoom "${MAX_ZOOM}" \
+          -r cubic \
+          --overview-resampling cubic \
+          --skip-blank \
+          --title "${PROJECT}" \
+          -j ALL_CPUS \
+          "${WGS84_TIF}" "${PROJ_OUT}"
+
+        # Inject <LookAt> so Google Earth focuses on the actual data instead
+        # of the union of world-spanning overview tile bounds.
+        if [[ -f "${PROJ_OUT}/doc.kml" ]]; then
+          if [[ -n "${LK_LON:-}" ]]; then
+            inject_lookat "${PROJ_OUT}/doc.kml" "${LK_LON}" "${LK_LAT}" "${LK_RANGE}"
+            echo "  LookAt: ${LK_LON}, ${LK_LAT} @ ${LK_RANGE}m"
+          fi
+          ensure_root_networklink "${PROJ_OUT}/doc.kml" "${PROJ_OUT}"
         fi
-        ensure_root_networklink "${PROJ_OUT}/doc.kml" "${PROJ_OUT}"
+
+        rm -f "${WGS84_TIF}"
       fi
 
-      rm -f "${WGS84_TIF}"
-    fi
-
-    # SHADE_TIF (native CRS) is the COG source for Step 7. Keep it in
-    # WORK_DIR when cog output is requested; EXIT trap cleans WORK_DIR.
-    [[ ${OUTPUT_COG} -eq 1 ]] || rm -f "${SHADE_TIF}"
+      # SHADE_TIF (native CRS) is the COG source for Step 7. Keep it in
+      # _proj_work when cog output is requested; EXIT trap cleans _proj_work.
+      [[ ${OUTPUT_COG} -eq 1 ]] || rm -f "${SHADE_TIF}"
+    done
   done
+
+  # ── Step 7: optional COG output ─────────────────────────────────────────────
+  # Produces self-contained Cloud-Optimized GeoTIFFs. CRS resolved per project.
+  local COG_PATHS=()
+  if [[ ${OUTPUT_COG} -eq 1 ]]; then
+    echo "=========================================="
+    echo "STEP 7: Packaging COG (DEM + shadings)"
+    echo "=========================================="
+    mkdir -p "${COG_DIR}"
+    declare -A PROJECT_COG_CRS=()
+    local COG_CRS_SUMMARY=""
+
+    local TARGET_CRS DEM_OUT
+    for PROJECT in "${PROJECT_NAMES[@]}"; do
+      TARGET_CRS=$(cog_resolve_crs "${DEM_VRT[${PROJECT}]}")
+      PROJECT_COG_CRS["${PROJECT}"]="${TARGET_CRS}"
+      DEM_OUT="${COG_DIR}/${PROJECT}_dem.tif"
+      echo "  ${PROJECT}/dem → ${TARGET_CRS}"
+      build_cog_dem "${DEM_VRT[${PROJECT}]}" "${DEM_OUT}" "${TARGET_CRS}"
+      COG_PATHS+=("${DEM_OUT}")
+      COG_CRS_SUMMARY+="${PROJECT}=${TARGET_CRS} "
+    done
+
+    local SHADE_TIF SHADE_OUT
+    for SHADING in "${SHADINGS[@]}"; do
+      for PROJECT in "${PROJECT_NAMES[@]}"; do
+        SHADE_TIF="${_proj_work}/${SHADING}_${PROJECT}.tif"
+        SHADE_OUT="${COG_DIR}/${SHADING}__${PROJECT}.tif"
+        TARGET_CRS="${PROJECT_COG_CRS[${PROJECT}]}"
+        echo "  ${SHADING}/${PROJECT} → ${TARGET_CRS}"
+        build_cog_shade "${SHADE_TIF}" "${SHADE_OUT}" "${TARGET_CRS}"
+        COG_PATHS+=("${SHADE_OUT}")
+      done
+    done
+
+    write_cog_readme "${COG_DIR}" "${COG_CRS_SUMMARY% }"
+  fi
+
+  # ── Step 8: optional KMZ packaging (one .kmz per super-overlay) ─────────────
+  # A KMZ archive expects exactly one doc.kml at its root. Each (shading,
+  # project) super-overlay is independently complete, so we ship one KMZ
+  # per super-overlay rather than zipping the whole tree.
+  local KMZ_PATHS=()
+  if [[ ${OUTPUT_KMZ} -eq 1 ]]; then
+    echo "=========================================="
+    echo "STEP 8: Packaging KMZ (one per super-overlay)"
+    echo "=========================================="
+    mkdir -p "${KMZ_DIR}"
+    local SRC KMZ_OUT
+    for SHADING in "${SHADINGS[@]}"; do
+      for PROJECT in "${PROJECT_NAMES[@]}"; do
+        SRC="${OUT_DIR}/${SHADING}/${PROJECT}"
+        KMZ_OUT="${KMZ_DIR}/${SHADING}__${PROJECT}.kmz"
+        package_kmz "${SRC}" "${KMZ_OUT}"
+        echo "  ${SHADING}/${PROJECT}: ${KMZ_OUT} ($(human_bytes "$(stat -c %s "${KMZ_OUT}")"))"
+        KMZ_PATHS+=("${KMZ_OUT}")
+      done
+    done
+  fi
+
+  echo "=========================================="
+  echo "ALL DONE  [${_hex}]  ${_project}"
+  echo "=========================================="
+  [[ ${OUTPUT_KML} -eq 1 ]] && echo "KML : ${OUT_DIR}/"
+  [[ ${#KMZ_PATHS[@]} -gt 0 ]] && echo "KMZ : ${KMZ_DIR}/"
+  [[ ${#COG_PATHS[@]} -gt 0 ]] && echo "COG : ${COG_DIR}/"
+  echo "=========================================="
+}
+
+# ─── Generate hex IDs, emit start events, dispatch ───────────────────────────
+mkdir -p "${LIDAR_DIR}/logs"
+
+declare -a _HEXES=()
+for (( _i=0; _i<_N_PROJECTS; _i++ )); do
+  _hex=$(gen_hex_id)
+  _HEXES+=("${_hex}")
+  events_emit_start "${_hex}" "${LIDAR_DIR}/logs/${_hex}.log" \
+    "${_FANOUT_PROJECTS[_i]}" "${INPUTS[@]}"
 done
 
-# ─── Step 7: Optional COG output (one DEM per project + one shade per pair) ──
-# Produces self-contained Cloud-Optimized GeoTIFFs in COG_DIR. CRS resolved
-# per project (cached on first call so the shade builders reuse the result).
-COG_PATHS=()
-if [[ ${OUTPUT_COG} -eq 1 ]]; then
-  echo "=========================================="
-  echo "STEP 7: Packaging COG (DEM + shadings)"
-  echo "=========================================="
-  mkdir -p "${COG_DIR}"
-  declare -A PROJECT_COG_CRS=()
-  COG_CRS_SUMMARY=""
+echo "Dispatching ${_N_PROJECTS} run(s) (jobs=${JOBS})..."
+for (( _i=0; _i<_N_PROJECTS; _i++ )); do
+  printf "  [%d/%d] %s  →  %s\n" \
+    "$((_i+1))" "${_N_PROJECTS}" \
+    "${_FANOUT_PROJECTS[_i]}" "${_HEXES[_i]}"
+done
 
-  for PROJECT in "${PROJECT_NAMES[@]}"; do
-    TARGET_CRS=$(cog_resolve_crs "${DEM_VRT[${PROJECT}]}")
-    PROJECT_COG_CRS["${PROJECT}"]="${TARGET_CRS}"
-    DEM_OUT="${COG_DIR}/${PROJECT}_dem.tif"
-    echo "  ${PROJECT}/dem → ${TARGET_CRS}"
-    build_cog_dem "${DEM_VRT[${PROJECT}]}" "${DEM_OUT}" "${TARGET_CRS}"
-    COG_PATHS+=("${DEM_OUT}")
-    COG_CRS_SUMMARY+="${PROJECT}=${TARGET_CRS} "
+# Supervisor subshell: manages concurrency, cleans up parent WORK_DIR when done.
+# Inherits all functions and variables via subshell fork.
+(
+  _active=0
+  for (( _i=0; _i<_N_PROJECTS; _i++ )); do
+    _run_one_project \
+      "${_FANOUT_PROJECTS[_i]}" \
+      "${_HEXES[_i]}" \
+      "${_FANOUT_URLFILES[_i]}" &
+    _active=$(( _active + 1 ))
+    if (( _active >= JOBS )); then
+      wait -n 2>/dev/null || true
+      _active=$(( _active - 1 ))
+    fi
   done
+  wait
+  rm -rf "${WORK_DIR}"
+) &
+disown
 
-  for SHADING in "${SHADINGS[@]}"; do
-    for PROJECT in "${PROJECT_NAMES[@]}"; do
-      SHADE_TIF="${WORK_DIR}/${SHADING}_${PROJECT}.tif"
-      SHADE_OUT="${COG_DIR}/${SHADING}__${PROJECT}.tif"
-      TARGET_CRS="${PROJECT_COG_CRS[${PROJECT}]}"
-      echo "  ${SHADING}/${PROJECT} → ${TARGET_CRS}"
-      build_cog_shade "${SHADE_TIF}" "${SHADE_OUT}" "${TARGET_CRS}"
-      COG_PATHS+=("${SHADE_OUT}")
-    done
-  done
-
-  write_cog_readme "${COG_DIR}" "${COG_CRS_SUMMARY% }"
-fi
-
-# ─── Step 8: Optional KMZ packaging (one .kmz per super-overlay) ─────────────
-# A KMZ archive expects exactly one doc.kml at its root. Each (shading,
-# project) super-overlay is independently complete, so we ship one KMZ
-# per super-overlay rather than zipping the whole tree.
-KMZ_PATHS=()
-if [[ ${OUTPUT_KMZ} -eq 1 ]]; then
-  echo "=========================================="
-  echo "STEP 8: Packaging KMZ (one per super-overlay)"
-  echo "=========================================="
-  KMZ_DIR="${LIDAR_DIR}/kmz/${NAME}"
-  mkdir -p "${KMZ_DIR}"
-  for SHADING in "${SHADINGS[@]}"; do
-    for PROJECT in "${PROJECT_NAMES[@]}"; do
-      SRC="${OUT_DIR}/${SHADING}/${PROJECT}"
-      KMZ_OUT="${KMZ_DIR}/${SHADING}__${PROJECT}.kmz"
-      package_kmz "${SRC}" "${KMZ_OUT}"
-      echo "  ${SHADING}/${PROJECT}: ${KMZ_OUT} ($(human_bytes "$(stat -c %s "${KMZ_OUT}")"))"
-      KMZ_PATHS+=("${KMZ_OUT}")
-    done
-  done
-fi
-
-echo "=========================================="
-echo "ALL DONE"
-echo "=========================================="
-if [[ ${OUTPUT_KML} -eq 1 ]]; then
-  echo "Pyramid root : ${OUT_DIR}/  ($(du -sh "${OUT_DIR}" | cut -f1))"
-  echo ""
-  echo "Super-overlays (open any in Google Earth via File → Open):"
-  for SHADING in "${SHADINGS[@]}"; do
-    for PROJECT in "${PROJECT_NAMES[@]}"; do
-      echo "  ${OUT_DIR}/${SHADING}/${PROJECT}/doc.kml"
-    done
-  done
-fi
-if [[ ${#KMZ_PATHS[@]} -gt 0 ]]; then
-  echo ""
-  echo "Portable KMZ files:"
-  for k in "${KMZ_PATHS[@]}"; do echo "  ${k}"; done
-fi
-if [[ ${#COG_PATHS[@]} -gt 0 ]]; then
-  echo ""
-  echo "COG output (drop into QGIS / ArcGIS / any GeoTIFF reader):"
-  echo "  ${COG_DIR}/  ($(du -sh "${COG_DIR}" | cut -f1))"
-  echo "  README       : ${COG_DIR}/README.md"
-fi
-echo "=========================================="
+echo "  Log(s) : ${LIDAR_DIR}/logs/"
+echo "  Track  : lidar list"

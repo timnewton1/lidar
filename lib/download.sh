@@ -97,8 +97,12 @@ prescan() {
     local PROJECT
     PROJECT=$(project_from_url "${URL}")
     if [[ -z "${PROJECT}" ]]; then
-      SKIPPED_NO_PROJECT=$((SKIPPED_NO_PROJECT + 1))
-      continue
+      if [[ -n "${FANOUT_PROJECT:-}" ]]; then
+        PROJECT="${FANOUT_PROJECT}"
+      else
+        SKIPPED_NO_PROJECT=$((SKIPPED_NO_PROJECT + 1))
+        continue
+      fi
     fi
     echo "${URL}" >> "${LISTS_DIR}/${PROJECT}.urls"
     PROJECT_COUNT["${PROJECT}"]=$((${PROJECT_COUNT["${PROJECT}"]:-0} + 1))
