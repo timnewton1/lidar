@@ -519,7 +519,7 @@ _run_one_project() {
   echo "=========================================="
 }
 
-# ─── Generate hex IDs, emit start events, dispatch ───────────────────────────
+# ─── Generate hex IDs and dispatch ───────────────────────────────────────────
 mkdir -p "${LIDAR_DIR}/logs"
 
 declare -a _HEXES=()
