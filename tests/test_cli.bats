@@ -149,6 +149,28 @@ setup() {
   (( rc_line < guard_line ))
 }
 
+@test "Bug B: events_emit_start uses BASHPID not \$\$" {
+  grep -q '\$BASHPID' "${LIDAR_HOME}/lib/events.sh"
+  ! grep -qP '"pid":%d.*\$\$' "${LIDAR_HOME}/lib/events.sh"
+}
+
+@test "Bug B: events_emit_start not called in pre-fork loop in lidar-run" {
+  local src="${LIDAR_HOME}/libexec/lidar-run"
+  # All events_emit_start calls must be inside _run_one_project, not in the
+  # pre-fork dispatch loop. Guard: no calls should appear after the line
+  # that defines _HEXES=() (start of pre-fork loop) and before the supervisor
+  # subshell comment.
+  local hexes_line supervisor_line
+  hexes_line=$(grep -n 'declare -a _HEXES' "${src}" | head -1 | cut -d: -f1)
+  supervisor_line=$(grep -n '^# Supervisor subshell' "${src}" | head -1 | cut -d: -f1)
+  # If any events_emit_start call falls in [hexes_line, supervisor_line], fail
+  local found=0
+  while IFS= read -r ln; do
+    (( ln >= hexes_line && ln <= supervisor_line )) && found=1
+  done < <(grep -n 'events_emit_start' "${src}" | cut -d: -f1)
+  (( found == 0 ))
+}
+
 # ─── Fan-out flags ────────────────────────────────────────────────────────────
 
 @test "lidar run --background flag rejected" {

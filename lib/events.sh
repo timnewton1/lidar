@@ -23,7 +23,7 @@ events_emit_start() {
   done
   urls_json+="]"
   printf '{"id":"%s","event":"start","ts":"%s","pid":%d,"log":"%s","project":"%s","urls":%s}\n' \
-    "$(json_escape "${id}")" "${ts}" "$$" "$(json_escape "${log}")" \
+    "$(json_escape "${id}")" "${ts}" "$BASHPID" "$(json_escape "${log}")" \
     "$(json_escape "${project}")" "${urls_json}" \
     >> "${EVENTS_FILE}"
 }

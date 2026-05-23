@@ -251,6 +251,7 @@ _run_one_project() {
   local _log="${_log_dir}/${_hex}.log"
   mkdir -p "${_log_dir}"
   exec > "${_log}" 2>&1
+  events_emit_start "${_hex}" "${_log}" "${_project}" "${INPUTS[@]}"
 
   local _proj_work; _proj_work=$(mktemp -d "${LIDAR_DIR}/.work_XXXXXX")
   WORK_DIR="${_proj_work}"
@@ -525,8 +526,6 @@ declare -a _HEXES=()
 for (( _i=0; _i<_N_PROJECTS; _i++ )); do
   _hex=$(gen_hex_id)
   _HEXES+=("${_hex}")
-  events_emit_start "${_hex}" "${LIDAR_DIR}/logs/${_hex}.log" \
-    "${_FANOUT_PROJECTS[_i]}" "${INPUTS[@]}"
 done
 
 echo "Dispatching ${_N_PROJECTS} run(s) (jobs=${JOBS})..."
