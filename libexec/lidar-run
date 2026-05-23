@@ -267,8 +267,8 @@ _run_one_project() {
 
   local _on_exit_done=0
   _on_project_exit() {
-    [[ ${_on_exit_done} -eq 1 ]] && return; _on_exit_done=1
     local _rc=$?
+    [[ ${_on_exit_done} -eq 1 ]] && return; _on_exit_done=1
     events_emit_end "${_hex}" "${_rc}"
     rm -rf "${_proj_work}"
   }

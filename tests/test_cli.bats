@@ -140,6 +140,15 @@ setup() {
   [[ "${row}" != *'"args":'* ]]
 }
 
+@test "Bug A: _on_project_exit captures \$? before re-entrancy guard" {
+  # Verify the fix is in place: local _rc=\$? must appear before the [[ check.
+  local src="${LIDAR_HOME}/libexec/lidar-run"
+  local rc_line guard_line
+  rc_line=$(grep -n 'local _rc=\$?' "${src}" | head -1 | cut -d: -f1)
+  guard_line=$(grep -n '\[\[ \${_on_exit_done}' "${src}" | head -1 | cut -d: -f1)
+  (( rc_line < guard_line ))
+}
+
 # ─── Fan-out flags ────────────────────────────────────────────────────────────
 
 @test "lidar run --background flag rejected" {
