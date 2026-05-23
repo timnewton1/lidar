@@ -224,3 +224,26 @@ setup() {
   [[ "${output}" == *"unknown subcommand"* ]]
 }
 
+# ─── Disk-discipline guard ───────────────────────────────────────────────────
+# /tmp is tmpfs on Bazzite/Fedora (16 GB RAM). Reprojected county-scale
+# rasters routinely exceed that — see run a3f4a8. Every mktemp invocation
+# in the run pipeline must explicitly pick a base on the output disk via
+# -p or -d <basedir>. A bare `mktemp` or `mktemp --suffix=...` lands in
+# $TMPDIR (default /tmp) and is a silent OOM trap.
+@test "no mktemp in run pipeline targets default TMPDIR" {
+  # Every mktemp invocation must reference one of the output-disk path
+  # variables (LIDAR_DIR, WORK_DIR, _proj_work) — either via -p/-d or in
+  # the template positional. A bare mktemp lands in /tmp = tmpfs.
+  run grep -nE 'mktemp(\s|$)' "${LIDAR_HOME}/libexec/lidar-run" "${LIDAR_HOME}/lib"/*.sh
+  while IFS= read -r line; do
+    [[ -z "${line}" ]] && continue
+    if [[ "${line}" == *'LIDAR_DIR'* \
+       || "${line}" == *'_proj_work'* \
+       || "${line}" == *'WORK_DIR'* ]]; then
+      continue
+    fi
+    echo "FORBIDDEN: ${line}" >&2
+    return 1
+  done <<< "${output}"
+}
+

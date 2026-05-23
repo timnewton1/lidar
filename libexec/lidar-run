@@ -81,8 +81,12 @@ for tok in "${_OUT_TOKENS[@]}"; do
     *)   echo "ERROR: --output unknown: '${tok}' (known: kml, kmz, cog)" >&2; exit 1 ;;
   esac
 done
-# kmz is just kml + zip; producing the zip requires the pyramid to exist.
-[[ ${OUTPUT_KMZ} -eq 1 ]] && OUTPUT_KML=1
+# kmz needs the pyramid to exist, but when the user didn't ask for kml the
+# tree is intermediate — it gets built under _proj_work and reclaimed on exit
+# (see KML_STAGE_ROOT below). When the user asked for kml, the tree IS the
+# deliverable and lives under OUT_DIR.
+NEED_PYRAMID=0
+[[ ${OUTPUT_KML} -eq 1 || ${OUTPUT_KMZ} -eq 1 ]] && NEED_PYRAMID=1
 if [[ ${OUTPUT_KML} -eq 0 && ${OUTPUT_KMZ} -eq 0 && ${OUTPUT_COG} -eq 0 ]]; then
   echo "ERROR: --output produced no outputs" >&2
   exit 1
@@ -251,6 +255,12 @@ _run_one_project() {
   local _proj_work; _proj_work=$(mktemp -d "${LIDAR_DIR}/.work_XXXXXX")
   WORK_DIR="${_proj_work}"
 
+  # Pin all scratch — ours and GDAL's — to the output disk. /tmp is tmpfs
+  # (16 GB RAM) on Bazzite/Fedora; reprojected county-scale rasters routinely
+  # exceed that and silently corrupt with libtiff "No space left on device"
+  # while gdalwarp keeps running for hours. See a3f4a8.
+  export TMPDIR="${_proj_work}" CPL_TMPDIR="${_proj_work}"
+
   # Copy url_file into private WORK_DIR before the parent's temp dir is removed.
   local _url_file="${_proj_work}/input.urls"
   cp "${_url_file_src}" "${_url_file}"
@@ -337,16 +347,27 @@ _run_one_project() {
   local COG_DIR="${_run_root}/cog"
   local KMZ_DIR="${_run_root}/kmz"
 
+  # KML_STAGE_ROOT: where the tile pyramid is built. When kml is a requested
+  # output, build into OUT_DIR (deliverable). When only kmz was requested,
+  # the un-zipped tree is intermediate — build under _proj_work so the EXIT
+  # trap reclaims it after KMZ packaging.
+  local KML_STAGE_ROOT
+  if [[ ${OUTPUT_KML} -eq 1 ]]; then
+    KML_STAGE_ROOT="${OUT_DIR}"
+  else
+    KML_STAGE_ROOT="${_proj_work}/kml_stage"
+  fi
+
   # ── Step 6: shading derivation + KML tile pyramids ──────────────────────────
   echo "=========================================="
-  if [[ ${OUTPUT_KML} -eq 1 ]]; then
+  if [[ ${NEED_PYRAMID} -eq 1 ]]; then
     echo "STEP 6: Deriving shadings + generating KML tile pyramids (${#SHADINGS[@]} shading(s) × ${#PROJECT_NAMES[@]} project(s))"
   else
     echo "STEP 6: Deriving shadings (${#SHADINGS[@]} shading(s) × ${#PROJECT_NAMES[@]} project(s)) — KML pyramid skipped"
   fi
   echo "=========================================="
 
-  [[ ${OUTPUT_KML} -eq 1 ]] && mkdir -p "${OUT_DIR}"
+  [[ ${NEED_PYRAMID} -eq 1 ]] && mkdir -p "${KML_STAGE_ROOT}"
 
   declare -A DEM_VRT=()
   for PROJECT in "${PROJECT_NAMES[@]}"; do
@@ -357,8 +378,8 @@ _run_one_project() {
 
   local SHADING
   for SHADING in "${SHADINGS[@]}"; do
-    local SHADING_DIR="${OUT_DIR}/${SHADING}"
-    [[ ${OUTPUT_KML} -eq 1 ]] && mkdir -p "${SHADING_DIR}"
+    local SHADING_DIR="${KML_STAGE_ROOT}/${SHADING}"
+    [[ ${NEED_PYRAMID} -eq 1 ]] && mkdir -p "${SHADING_DIR}"
 
     for PROJECT in "${PROJECT_NAMES[@]}"; do
       local SHADE_TIF="${_proj_work}/${SHADING}_${PROJECT}.tif"
@@ -370,9 +391,9 @@ _run_one_project() {
       echo "  Deriving ${SHADING}..."
       derive_shading "${SHADING}" "${DEM_VRT[${PROJECT}]}" "${SHADE_TIF}"
 
-      if [[ ${OUTPUT_KML} -eq 1 ]]; then
+      if [[ ${NEED_PYRAMID} -eq 1 ]]; then
         local PROJ_OUT="${SHADING_DIR}/${PROJECT}"
-        local WGS84_TIF; WGS84_TIF=$(mktemp --suffix=_wgs84.tif)
+        local WGS84_TIF; WGS84_TIF=$(mktemp -p "${_proj_work}" wgs84_XXXXXX.tif)
         mkdir -p "${PROJ_OUT}"
 
         echo "  Reprojecting to WGS84..."
@@ -479,7 +500,7 @@ _run_one_project() {
     local SRC KMZ_OUT
     for SHADING in "${SHADINGS[@]}"; do
       for PROJECT in "${PROJECT_NAMES[@]}"; do
-        SRC="${OUT_DIR}/${SHADING}/${PROJECT}"
+        SRC="${KML_STAGE_ROOT}/${SHADING}/${PROJECT}"
         KMZ_OUT="${KMZ_DIR}/${SHADING}__${PROJECT}.kmz"
         package_kmz "${SRC}" "${KMZ_OUT}"
         echo "  ${SHADING}/${PROJECT}: ${KMZ_OUT} ($(human_bytes "$(stat -c %s "${KMZ_OUT}")"))"
