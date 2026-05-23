@@ -39,15 +39,20 @@ lidar run --output cog ~/Downloads/downloadlist.txt
 lidar run --output kml,cog ~/Downloads/downloadlist.txt
 ```
 
+When a tile list spans multiple USGS projects, `lidar run` dispatches one
+independent run per project and returns immediately. Each run gets its own
+hex ID, log file, and output directory. Use `--jobs N` to cap concurrency.
+
 Outputs land under `${GIS_DIR}/lidar/`:
 
 ```
 ${GIS_DIR}/lidar/
-  tiles/dem/           # downloaded source tiles (cached, shared across runs)
-  kml/<name>/          # Google Earth super-overlay pyramid
-  kmz/<name>/          # zipped pyramid (.kmz files, one per shading×project)
-  cog/<name>/          # Cloud-Optimized GeoTIFFs (DEM + shadings) + README.md
-  logs/                # per-run log files + events index
+  tiles/dem/                        # downloaded source tiles (cached, shared across runs)
+  projects/<project>/<hex>/kml/     # Google Earth super-overlay pyramid
+  projects/<project>/<hex>/kmz/     # zipped .kmz files (one per shading×project)
+  projects/<project>/<hex>/cog/     # Cloud-Optimized GeoTIFFs + README.md
+  logs/<hex>.log                    # per-run log file
+  logs/runs.jsonl                   # events index
 ```
 
 ## Subcommands
@@ -55,12 +60,10 @@ ${GIS_DIR}/lidar/
 | Command | What it does |
 |---|---|
 | `lidar run` | Download tiles, mosaic, derive shading, build outputs |
-| `lidar list` | Recent runs from the events index |
-| `lidar log <name\|hex>` | Stream (running) or page (done) a run's log |
-| `lidar size <name\|hex>` | Disk usage breakdown for a run's output |
-| `lidar kill <name\|hex\|PID>` | Stop a running pipeline (or `--all`) |
-| `lidar service install <name>` | Wrap a run as a systemd `--user` service |
-| `lidar service uninstall <name>` | Remove a service |
+| `lidar list [<hex>]` | Run table, or stream/page one run's log |
+| `lidar size <hex>` | Disk usage breakdown for a run's output |
+| `lidar kill <hex\|PID>` | Stop a running pipeline (or `--all`) |
+| `lidar restart <hex>` | Re-run a completed or failed run |
 | `lidar help` | This help |
 
 Run `lidar <subcommand> --help` for per-subcommand flags.
@@ -83,7 +86,6 @@ a UTM zone from the data centroid if geographic. Override with
 lidar                  # entrypoint dispatcher
 libexec/lidar-*        # subcommand implementations
 lib/*.sh               # shared helpers (gdal, kml, cog, download, events)
-systemd/               # systemd unit template for `lidar service`
 tests/                 # bats tests + fixtures
 docs/superpowers/      # design specs and implementation plans
 ```

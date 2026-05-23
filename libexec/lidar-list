@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# `lidar list` — list runs or stream/page a single run's log.
+#
+# Usage: lidar list [options] [<hex>]
+#
+# With no argument: print the run table (newest first).
+# With a hex argument: tail (running) or page (done) that run's log.
+#
+# Options:
+#   -n, --lines N        show last N lines (default: all)
+#   --no-follow          use pager even for running logs
+#   --pager CMD          pager for completed logs (default: less)
+#   --gis-dir PATH       override GIS_DIR
+#   -h, --help           show this help
+
+source "${LIDAR_HOME}/lib/strict.sh"
+
+usage() { sed -n '3,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+
+LINES=""
+GIS_DIR_OVERRIDE=""
+TARGET=""
+NO_FOLLOW=0
+PAGER_CMD=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--lines)    LINES="$2"; shift 2 ;;
+    --no-follow)   NO_FOLLOW=1; shift ;;
+    --pager)       PAGER_CMD="$2"; shift 2 ;;
+    --gis-dir)     GIS_DIR_OVERRIDE="$2"; shift 2 ;;
+    -h|--help)     usage 0 ;;
+    -*)            echo "Unknown flag: $1" >&2; usage ;;
+    *)             [[ -n "${TARGET}" ]] && { echo "Too many arguments" >&2; usage; }
+                   TARGET="$1"; shift ;;
+  esac
+done
+
+[[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
+source "${LIDAR_HOME}/lib/common.sh"
+source "${LIDAR_HOME}/lib/events.sh"
+
+_get_pager() { printf '%s' "${PAGER_CMD:-${LIDAR_PAGER:-${PAGER:-less}}}"; }
+
+_exec_pager() {
+  local log="$1"
+  local pager; pager=$(_get_pager)
+  if [[ "${pager}" == "less" ]]; then
+    if [[ -n "${LINES}" ]]; then
+      local total; total=$(wc -l < "${log}")
+      local start=$(( total - LINES + 1 ))
+      (( start < 1 )) && start=1
+      exec less +"${start}g" "${log}"
+    else
+      exec less +G "${log}"
+    fi
+  else
+    read -ra _pw <<< "${pager}"
+    exec "${_pw[@]}" "${log}"
+  fi
+}
+
+# ─── No argument: print the run table ────────────────────────────────────────
+if [[ -z "${TARGET}" ]]; then
+  list_runs
+  exit 0
+fi
+
+# ─── Hex argument: show that run's log ───────────────────────────────────────
+RUN_ID=$(resolve_run_id "${TARGET}") || exit 1
+
+LOG_PATH=$(jq -rs --arg id "${RUN_ID}" '
+  .[] | select(.id == $id and .event == "start") | .log // ""
+' "${EVENTS_FILE}" 2>/dev/null || echo "")
+
+if [[ -z "${LOG_PATH}" || "${LOG_PATH}" == "null" || ! -f "${LOG_PATH}" ]]; then
+  LOG_PATH="${LIDAR_DIR}/logs/${RUN_ID}.log"
+fi
+
+if [[ ! -f "${LOG_PATH}" ]]; then
+  echo "ERROR: log file not found for '${TARGET}'" >&2
+  exit 1
+fi
+
+PID=$(jq -rs --arg id "${RUN_ID}" '
+  .[] | select(.id == $id and .event == "start") | .pid // 0
+' "${EVENTS_FILE}" 2>/dev/null || echo 0)
+DONE=$(jq -rs --arg id "${RUN_ID}" '
+  [ .[] | select(.id == $id and .event == "end") ] | length > 0
+' "${EVENTS_FILE}" 2>/dev/null || echo "false")
+
+RUNNING=0
+if [[ "${DONE}" == "false" && -n "${PID}" && "${PID}" != "0" ]]; then
+  kill -0 "${PID}" 2>/dev/null && RUNNING=1 || true
+fi
+
+if [[ ${RUNNING} -eq 1 && ${NO_FOLLOW} -eq 0 ]]; then
+  _tf=(-F)
+  [[ -n "${LINES}" ]] && _tf=(-n "${LINES}" -F)
+  exec tail "${_tf[@]}" "${LOG_PATH}"
+else
+  if [[ -t 1 ]]; then
+    _exec_pager "${LOG_PATH}"
+  else
+    [[ -n "${LINES}" ]] && exec tail -n "${LINES}" "${LOG_PATH}" || exec cat "${LOG_PATH}"
+  fi
+fi

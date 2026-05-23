@@ -98,29 +98,23 @@ setup() {
   [[ "${output}" == *"--cog-no-reproject"* ]]
 }
 
-@test "lidar run --dry-run prints plan and exits 0" {
-  # --dry-run on one_tile.txt still runs check_deps_and_input which verifies
-  # flatpak is installed; skip that check by ensuring TOTAL_TILES is satisfied.
-  # We patch GIS_DIR to a tmpdir that already has a mock DEM dir so flatpak
-  # check doesn't stop us — but this test just verifies parsing / shading
-  # validation. We accept non-zero if flatpak or flatpak app is absent.
+@test "lidar run --dry-run prints plan header" {
+  # Accept non-zero if flatpak/GDAL absent; validation runs before deps check.
   run bash -c "
     export GIS_DIR=\"${GIS_DIR}\"
     export LIDAR_HOME=\"${LIDAR_HOME}\"
     mkdir -p \"\${GIS_DIR}/lidar\"
-    \"${LIDAR}\" run --dry-run --name testrun \"${FIXTURES}/one_tile.txt\" 2>&1 || true
+    \"${LIDAR}\" run --dry-run \"${FIXTURES}/one_tile.txt\" 2>&1 || true
   "
-  # If flatpak dep fails that's ok; the plan line only prints when deps pass.
-  # What we care about: shading and algorithm validation still happens before deps.
-  :
+  # --name is gone; we just check the flag doesn't trip an "Unknown flag" error.
+  [[ "${output}" != *"Unknown flag: --name"* ]]
 }
 
-@test "lidar run --dry-run prints name when deps available (offline-safe)" {
+@test "lidar run --dry-run passes with one_tile.txt (integration-safe)" {
   skip "requires flatpak GDAL installed — integration test only"
-  run "${LIDAR}" run --dry-run --name testrun "${FIXTURES}/one_tile.txt"
+  run "${LIDAR}" run --dry-run "${FIXTURES}/one_tile.txt"
   [ "${status}" -eq 0 ]
   [[ "${output}" == *"DRY RUN PLAN"* ]]
-  [[ "${output}" == *"testrun"* ]]
 }
 
 @test "lidar kill with no args exits 2" {
@@ -135,7 +129,121 @@ setup() {
   [[ "${output}" == *"REFUSE PID 1"* ]]
 }
 
-@test "lidar service install with no name exits 2" {
-  run "${LIDAR}" service install
+@test "events_emit_start writes project field and urls key" {
+  source "${LIDAR_HOME}/lib/common.sh"
+  source "${LIDAR_HOME}/lib/events.sh"
+  events_emit_start "aabbcc" "" "TestProject" "a.txt" "b.txt"
+  local row
+  row=$(tail -1 "${GIS_DIR}/lidar/logs/runs.jsonl")
+  [[ "${row}" == *'"project":"TestProject"'* ]]
+  [[ "${row}" == *'"urls":'* ]]
+  [[ "${row}" != *'"args":'* ]]
+}
+
+# ─── Fan-out flags ────────────────────────────────────────────────────────────
+
+@test "lidar run --background flag rejected" {
+  run "${LIDAR}" run --background "${FIXTURES}/one_tile.txt"
+  [ "${status}" -ne 0 ]
+  [[ "${output}" == *"Unknown flag"* ]]
+}
+
+@test "lidar run --name flag rejected" {
+  run "${LIDAR}" run --name foo "${FIXTURES}/one_tile.txt"
+  [ "${status}" -ne 0 ]
+  [[ "${output}" == *"Unknown flag"* ]]
+}
+
+@test "lidar run --jobs 0 rejected" {
+  run "${LIDAR}" run --jobs 0 "${FIXTURES}/one_tile.txt"
+  [ "${status}" -ne 0 ]
+  [[ "${output}" == *"--jobs must be a positive integer"* ]]
+}
+
+@test "lidar run --jobs 2 accepted (reaches downstream)" {
+  run bash -c "\"${LIDAR}\" run --jobs 2 --dry-run \"${FIXTURES}/one_tile.txt\" 2>&1 || true"
+  [[ "${output}" != *"Unknown flag"* ]]
+  [[ "${output}" != *"--jobs must be"* ]]
+}
+
+@test "lidar run accepts two positional files" {
+  run bash -c "\"${LIDAR}\" run \"${FIXTURES}/one_tile.txt\" \"${FIXTURES}/one_tile.txt\" --dry-run 2>&1 || true"
+  [[ "${output}" != *"Unknown flag"* ]]
+  [[ "${output}" != *"Too many"* ]]
+}
+
+# ─── list / restart subcommands ──────────────────────────────────────────────
+
+@test "lidar list with no args exits 0" {
+  run "${LIDAR}" list
+  [ "${status}" -eq 0 ]
+  [[ "${output}" == *"STATUS"* || "${output}" == *"no runs yet"* ]]
+}
+
+@test "lidar list --help exits 0" {
+  run "${LIDAR}" list --help
+  [ "${status}" -eq 0 ]
+  [[ "${output}" == *"lidar list"* ]]
+}
+
+@test "lidar restart with no args exits 2" {
+  run "${LIDAR}" restart
   [ "${status}" -eq 2 ]
 }
+
+@test "lidar restart --help exits 0" {
+  run "${LIDAR}" restart --help
+  [ "${status}" -eq 0 ]
+  [[ "${output}" == *"lidar restart"* ]]
+}
+
+@test "lidar restart unknown hex exits non-zero with error message" {
+  rm -f "${GIS_DIR}/lidar/logs/runs.jsonl"
+  run "${LIDAR}" restart aabbcc
+  [ "${status}" -ne 0 ]
+  [[ "${output}" == *"no run"* || "${output}" == *"no runs"* ]]
+}
+
+# ─── Removed subcommands ─────────────────────────────────────────────────────
+
+@test "lidar log subcommand is gone" {
+  run "${LIDAR}" log
+  [ "${status}" -eq 2 ]
+  [[ "${output}" == *"unknown subcommand"* ]]
+}
+
+@test "lidar rerun subcommand is gone" {
+  run "${LIDAR}" rerun
+  [ "${status}" -eq 2 ]
+  [[ "${output}" == *"unknown subcommand"* ]]
+}
+
+@test "lidar service subcommand is gone" {
+  run "${LIDAR}" service install
+  [ "${status}" -eq 2 ]
+  [[ "${output}" == *"unknown subcommand"* ]]
+}
+
+# ─── Disk-discipline guard ───────────────────────────────────────────────────
+# /tmp is tmpfs on Bazzite/Fedora (16 GB RAM). Reprojected county-scale
+# rasters routinely exceed that — see run a3f4a8. Every mktemp invocation
+# in the run pipeline must explicitly pick a base on the output disk via
+# -p or -d <basedir>. A bare `mktemp` or `mktemp --suffix=...` lands in
+# $TMPDIR (default /tmp) and is a silent OOM trap.
+@test "no mktemp in run pipeline targets default TMPDIR" {
+  # Every mktemp invocation must reference one of the output-disk path
+  # variables (LIDAR_DIR, WORK_DIR, _proj_work) — either via -p/-d or in
+  # the template positional. A bare mktemp lands in /tmp = tmpfs.
+  run grep -nE 'mktemp(\s|$)' "${LIDAR_HOME}/libexec/lidar-run" "${LIDAR_HOME}/lib"/*.sh
+  while IFS= read -r line; do
+    [[ -z "${line}" ]] && continue
+    if [[ "${line}" == *'LIDAR_DIR'* \
+       || "${line}" == *'_proj_work'* \
+       || "${line}" == *'WORK_DIR'* ]]; then
+      continue
+    fi
+    echo "FORBIDDEN: ${line}" >&2
+    return 1
+  done <<< "${output}"
+}
+

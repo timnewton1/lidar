@@ -5,7 +5,7 @@
 #   lidar kill <target> [<target>...]   kill specific tracked runs
 #                                       target = PID or run name/hex suffix
 #   lidar kill --all                    kill everything: events-tracked runs,
-#                                       lidar@*.service units, stray processes
+#                                       stray processes
 #
 # Bare PIDs are sanity-checked against the events index — refuses to kill
 # anything not currently tracked as a running lidar run. Name/hex args are
@@ -58,11 +58,18 @@ if [[ ${#TARGETS[@]} -gt 0 ]]; then
     target_id=""
     if [[ "${t}" =~ ^[0-9]+$ ]]; then
       if [[ -z "${TRACKED_BY_PID[${t}]:-}" ]]; then
-        echo "  REFUSE PID ${t} — not a tracked running lidar run" >&2
-        exit 1
+        # Not in events index — allow if cmdline shows it's a lidar process
+        cmdline=$(tr '\0' ' ' < "/proc/${t}/cmdline" 2>/dev/null || true)
+        if [[ -z "${cmdline}" ]]; then
+          echo "  REFUSE PID ${t} — process not found" >&2; exit 1
+        fi
+        if [[ "${cmdline}" != *lidar* ]]; then
+          echo "  REFUSE PID ${t} — not a lidar process (cmdline: ${cmdline})" >&2; exit 1
+        fi
+        echo "  WARN PID ${t} — untracked (events index miss); killing anyway" >&2
       fi
       target_pid="${t}"
-      target_id="${TRACKED_BY_PID[${t}]}"
+      target_id="${TRACKED_BY_PID[${t}]:-untracked}"
     else
       resolve_input "${t}" || exit 1
       [[ "${INPUT_TYPE}" == "run" ]] || { echo "  REFUSE '${t}' — is a tile list, not a run" >&2; exit 1; }
@@ -85,17 +92,6 @@ while read -r p id; do
   kill_target "${p}" "PID ${p} (${id})"
   killed=$((killed + 1))
 done < <(running_pids)
-
-# systemd lidar@*.service units
-if command -v systemctl >/dev/null; then
-  while IFS= read -r unit; do
-    [[ -z "${unit}" ]] && continue
-    echo "  STOP systemd unit ${unit}"
-    systemctl --user stop "${unit}" 2>/dev/null || true
-    killed=$((killed + 1))
-  done < <(systemctl --user list-units --type=service --no-legend --plain \
-           'lidar@*.service' 2>/dev/null | awk '{print $1}')
-fi
 
 # Stray lidar-run processes not in the events index (e.g. pre-events manual runs)
 while IFS= read -r p; do
