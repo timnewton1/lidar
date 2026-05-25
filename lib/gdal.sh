@@ -77,7 +77,7 @@ derive_shading() {
 # Returns 1 if any field is missing.
 _read_raster_dims() {
   local tif="$1" info
-  info=$("${GDALINFO[@]}" "${tif}" 2>/dev/null) || return 1
+  info=$(run_gdal "${GDALINFO[@]}" "${tif}" 2>/dev/null) || return 1
   # `|| true` keeps pipefail-under-set-e from killing us if grep misses; the
   # explicit empty-string checks below handle the failure path.
   SIZE_X=$(echo "${info}" | { grep -oP '^Size is \K[0-9]+'           || true; })
@@ -104,7 +104,7 @@ compute_zoom_and_lookat() {
   # lookat, but it only retains the scalar pixel size. For lookat we need corners
   # too, so we run gdalinfo once more — but only once total for both outputs.
   local info
-  info=$("${GDALINFO[@]}" "${tif}" 2>/dev/null) || return 1
+  info=$(run_gdal "${GDALINFO[@]}" "${tif}" 2>/dev/null) || return 1
   local cx cy ulx uly lrx lry
   cx=$(echo "${info}"  | { grep -oP '^Center\s*\(\s*\K-?[0-9.]+'                    || true; })
   cy=$(echo "${info}"  | { grep -oP '^Center\s*\(\s*-?[0-9.]+,\s*\K-?[0-9.]+'       || true; })

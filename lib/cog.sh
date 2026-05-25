@@ -33,7 +33,7 @@ cog_resolve_crs() {
     return 0
   fi
   local json
-  json=$("${GDALINFO[@]}" -json "${tif}" 2>/dev/null) || { echo "native"; return 0; }
+  json=$(run_gdal "${GDALINFO[@]}" -json "${tif}" 2>/dev/null) || { echo "native"; return 0; }
   python3 - "${json}" "${COG_NO_REPROJECT:-0}" <<'PY'
 import sys, json, re
 try:
