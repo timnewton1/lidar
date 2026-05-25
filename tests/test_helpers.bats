@@ -147,3 +147,27 @@ setup() {
   [[ "${result}" == *"Alpha_2020"* ]]
   [[ "${result}" == *"Beta_2021"* ]]
 }
+
+@test "diag_system_snapshot prints disk available" {
+  source "${LIDAR_HOME}/lib/diag.sh"
+  result=$(diag_system_snapshot "${BATS_TMPDIR}")
+  [[ "${result}" == *"disk_avail"* ]]
+}
+
+@test "diag_system_snapshot prints ram_avail_mb" {
+  source "${LIDAR_HOME}/lib/diag.sh"
+  result=$(diag_system_snapshot "${BATS_TMPDIR}")
+  [[ "${result}" == *"ram_avail_mb"* ]]
+}
+
+@test "diag_system_snapshot prints tmpfs_avail" {
+  source "${LIDAR_HOME}/lib/diag.sh"
+  result=$(diag_system_snapshot "${BATS_TMPDIR}")
+  [[ "${result}" == *"tmpfs_avail"* ]]
+}
+
+@test "diag_pre_run prints GDAL_FLATPAK_APP" {
+  source "${LIDAR_HOME}/lib/diag.sh"
+  result=$(diag_pre_run "${BATS_TMPDIR}" 2>&1 || true)
+  [[ "${result}" == *"${GDAL_FLATPAK_APP}"* ]]
+}
