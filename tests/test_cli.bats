@@ -261,6 +261,17 @@ setup() {
 # in the run pipeline must explicitly pick a base on the output disk via
 # -p or -d <basedir>. A bare `mktemp` or `mktemp --suffix=...` lands in
 # $TMPDIR (default /tmp) and is a silent OOM trap.
+@test "lidar run --strict-downloads flag is accepted" {
+  run bash -c "\"${LIDAR}\" run --strict-downloads --dry-run \"${FIXTURES}/one_tile.txt\" 2>&1 || true"
+  [[ "${output}" != *"Unknown flag"* ]]
+  [[ "${output}" != *"unknown flag"* ]]
+}
+
+@test "lidar run --strict-downloads appears in dry-run plan" {
+  run bash -c "\"${LIDAR}\" run --strict-downloads --dry-run \"${FIXTURES}/one_tile.txt\" 2>&1 || true"
+  [[ "${output}" == *"strict_downloads=1"* ]]
+}
+
 @test "no mktemp in run pipeline targets default TMPDIR" {
   # Every mktemp invocation must reference one of the output-disk path
   # variables (LIDAR_DIR, WORK_DIR, _proj_work) — either via -p/-d or in
