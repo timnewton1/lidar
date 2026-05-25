@@ -17,9 +17,9 @@ diag_system_snapshot() {
   tmpfs_kb=$(df -k /tmp 2>/dev/null | awk 'NR==2{print $4}')
   load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "?")
   printf 'disk_avail=%s  ram_avail_mb=%s  tmpfs_avail=%s  load=%s\n' \
-    "$(human_bytes "${disk_kb}000" 2>/dev/null || echo "${disk_kb}KB")" \
+    "$(human_bytes "$(( disk_kb * 1024 ))" 2>/dev/null || echo "${disk_kb}KB")" \
     "${ram_avail_mb}" \
-    "$(human_bytes "${tmpfs_kb}000" 2>/dev/null || echo "${tmpfs_kb}KB")" \
+    "$(human_bytes "$(( tmpfs_kb * 1024 ))" 2>/dev/null || echo "${tmpfs_kb}KB")" \
     "${load1}"
 }
 
@@ -34,7 +34,7 @@ diag_pre_run() {
   echo "=========================================="
   echo "  Flatpak app : ${GDAL_FLATPAK_APP}"
   local gdal_ver
-  gdal_ver=$(flatpak run --command=gdal "${GDAL_FLATPAK_APP}" --version 2>/dev/null || echo "unknown")
+  gdal_ver=$("${GDAL[@]}" --version 2>/dev/null || echo "unknown")
   echo "  GDAL version: ${gdal_ver}"
   echo "  $(diag_system_snapshot "${output_dir}")"
   local disk_kb
