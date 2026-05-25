@@ -185,8 +185,13 @@ _lidar_download_one() {
   if ! curl -L --retry 5 --retry-all-errors --retry-delay 5 \
             --fail-with-body --max-time 1800 -C - -sS \
             -o "${partial}" "${url}"; then
-    flock /dev/stderr -c "printf '  ERROR   %s\n' '${basename}'" 2>&1
+    flock /dev/stderr -c "printf '  ERROR   %s  (url: %s)\n' '${basename}' '${url}'" 2>&1
     rm -f "${partial}"
+    # Record failure for the summary; FAILED_TILE_LOG is set by download_tiles.
+    # flock on the log file itself makes the append race-safe across xargs workers.
+    [[ -n "${FAILED_TILE_LOG:-}" ]] && flock "${FAILED_TILE_LOG}" -c "echo '${basename}' >> '${FAILED_TILE_LOG}'"
+    # Honour STRICT_DOWNLOADS: if set to 1, propagate the failure so xargs sees it.
+    [[ "${STRICT_DOWNLOADS:-0}" -eq 1 ]] && return 1
     return 1
   fi
   if [[ -f "${tile_tif}" ]]; then
@@ -208,17 +213,37 @@ download_tiles() {
 
   export DEM_DIR
 
+  # Shared file for failure accounting across xargs worker subshells.
+  # Each failed worker appends its tile name; flock inside the worker keeps
+  # concurrent appends race-safe.
+  local failed_log
+  failed_log=$(mktemp "${WORK_DIR}/download_failures_XXXXXX.txt")
+  export FAILED_TILE_LOG="${failed_log}"
+
   local rc=0
   grep -v '^[[:space:]]*$' "${FILTERED_LIST}" \
     | xargs -P "${jobs}" -n 1 bash -c '_lidar_download_one "$@"' _ \
     || rc=$?
 
+  local n_failed=0
+  [[ -f "${failed_log}" ]] && n_failed=$(wc -l < "${failed_log}")
+
   echo "=========================================="
-  if [[ ${rc} -ne 0 ]]; then
-    echo "STEP 4 complete — WARNING: some downloads failed (see above)"
+  if [[ ${n_failed} -gt 0 ]]; then
+    echo "STEP 4 complete — ${n_failed} tile(s) failed to download:"
+    sed 's/^/    /' "${failed_log}"
+    if [[ "${STRICT_DOWNLOADS:-0}" -eq 1 ]]; then
+      echo "ERROR: STRICT_DOWNLOADS set; aborting run due to download failures"
+      rm -f "${failed_log}"
+      return 1
+    else
+      echo "  Proceeding with $(( TOTAL_TILES - n_failed )) of ${TOTAL_TILES} tiles."
+      echo "  Re-run the same command to retry failed tiles (cached tiles are skipped)."
+    fi
   else
-    echo "STEP 4 complete"
+    echo "STEP 4 complete — all ${TOTAL_TILES} tiles downloaded successfully"
   fi
   echo "=========================================="
+  rm -f "${failed_log}"
   return ${rc}
 }

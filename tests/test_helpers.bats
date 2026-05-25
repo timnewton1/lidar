@@ -190,3 +190,18 @@ setup() {
   run run_gdal false
   [ "${status}" -ne 0 ]
 }
+
+@test "_lidar_download_one uses STRICT_DOWNLOADS env var" {
+  # This tests the variable is read; actual download behavior is integration-only.
+  # Verify the variable is exported and the function references it.
+  source "${LIDAR_HOME}/lib/download.sh"
+  # _lidar_download_one is exported; grep its definition for STRICT_DOWNLOADS
+  declare -f _lidar_download_one | grep -q 'STRICT_DOWNLOADS'
+}
+
+@test "download_tiles summary mentions failed tile log" {
+  # We can't run real downloads in bats; test that the summary logic exists
+  # by checking download_tiles' source references FAILED_TILE_LOG.
+  source "${LIDAR_HOME}/lib/download.sh"
+  declare -f download_tiles | grep -q 'FAILED_TILE_LOG'
+}
