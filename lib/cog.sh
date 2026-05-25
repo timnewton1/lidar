@@ -84,7 +84,7 @@ build_cog_dem() {
   local tmp_reproj="${out%.tif}__reproj.tif"
 
   if [[ "${target}" != "native" ]]; then
-    "${GDALWARP[@]}" -t_srs "${target}" \
+    run_gdal "${GDALWARP[@]}" -t_srs "${target}" \
       -srcnodata "${DEM_NODATA}" -dstnodata "${DEM_NODATA}" \
       -r bilinear -multi -wo NUM_THREADS=ALL_CPUS \
       -co COMPRESS=DEFLATE -co TILED=YES -co BIGTIFF=YES \
@@ -94,7 +94,7 @@ build_cog_dem() {
 
   # AVERAGE preserves mean elevation across overview levels; BILINEAR is for
   # upsampling and can create NoData holes at coarser zoom levels.
-  "${GDALTRANSLATE[@]}" -of COG \
+  run_gdal "${GDALTRANSLATE[@]}" -of COG \
     -co COMPRESS=ZSTD \
     -co PREDICTOR=FLOATING_POINT \
     -co BLOCKSIZE=512 \
@@ -115,7 +115,7 @@ build_cog_shade() {
   local tmp_reproj="${out%.tif}__reproj.tif"
 
   if [[ "${target}" != "native" ]]; then
-    "${GDALWARP[@]}" -t_srs "${target}" \
+    run_gdal "${GDALWARP[@]}" -t_srs "${target}" \
       -srcnodata 0 -dstalpha \
       -r bilinear -multi -wo NUM_THREADS=ALL_CPUS \
       -co COMPRESS=DEFLATE -co TILED=YES -co BIGTIFF=YES \
@@ -125,7 +125,7 @@ build_cog_shade() {
 
   # NEAREST avoids interpolation artifacts in uint8 visual rasters (hillshade,
   # slopeshade). BILINEAR/AVERAGE can blend transparent edges into real pixels.
-  "${GDALTRANSLATE[@]}" -of COG \
+  run_gdal "${GDALTRANSLATE[@]}" -of COG \
     -co COMPRESS=ZSTD \
     -co BLOCKSIZE=512 \
     -co OVERVIEW_RESAMPLING=NEAREST \

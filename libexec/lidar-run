@@ -419,7 +419,7 @@ _run_one_project() {
         { read -r MAX_ZOOM; read -r LK_LON LK_LAT LK_RANGE; } \
           < <(compute_zoom_and_lookat "${WGS84_TIF}") || true
         echo "  Zoom range: 0-${MAX_ZOOM} (min=world, max=native resolution)"
-        "${GDAL[@]}" raster tile \
+        run_gdal "${GDAL[@]}" raster tile \
           --tiling-scheme WorldCRS84Quad \
           --kml \
           --webviewer none \

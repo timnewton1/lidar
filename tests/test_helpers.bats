@@ -171,3 +171,22 @@ setup() {
   result=$(diag_pre_run "${BATS_TMPDIR}" 2>&1 || true)
   [[ "${result}" == *"${GDAL_FLATPAK_APP}"* ]]
 }
+
+@test "run_gdal logs the command before running it" {
+  source "${LIDAR_HOME}/lib/gdal.sh"
+  # Use 'true' as a stand-in GDAL command — we're testing the logging, not GDAL
+  result=$(run_gdal true --some-flag /input /output 2>&1)
+  [[ "${result}" == *"true --some-flag /input /output"* ]]
+}
+
+@test "run_gdal executes the command" {
+  source "${LIDAR_HOME}/lib/gdal.sh"
+  run run_gdal true
+  [ "${status}" -eq 0 ]
+}
+
+@test "run_gdal propagates non-zero exit" {
+  source "${LIDAR_HOME}/lib/gdal.sh"
+  run run_gdal false
+  [ "${status}" -ne 0 ]
+}

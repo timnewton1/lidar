@@ -6,6 +6,14 @@
 [[ -n "${_LIDAR_GDAL_LOADED:-}" ]] && return 0
 _LIDAR_GDAL_LOADED=1
 
+# run_gdal <cmd> [args...]: log the full invocation then exec.
+# All GDAL calls go through this so the log always shows the exact command
+# that was running when the process was interrupted or crashed.
+run_gdal() {
+  echo "  + $*" >&2
+  "$@"
+}
+
 # ─── WorldCRS84Quad geometry (OGC TileMatrixSet 2D spec) ─────────────────────
 # At zoom 0 the world is tiled 2×1; each tile spans 180° square. At zoom z
 # there are 2^(z+1) × 2^z tiles, each 180/2^z degrees on a side. Tiles are
@@ -36,7 +44,7 @@ derive_hillshade() {
   else
     args+=(-az "${HS_AZIMUTH}" -alt "${HS_ALTITUDE}" -combined)
   fi
-  "${GDALDEM[@]}" "${args[@]}"
+  run_gdal "${GDALDEM[@]}" "${args[@]}"
 }
 
 # Slopeshade: slope in degrees → grayscale via color-relief
@@ -45,13 +53,13 @@ derive_slopeshade() {
   local in="$1" out="$2"
   local slope_tif="${out%.tif}_slope.tif"
   local ramp="${out%.tif}_ramp.txt"
-  "${GDALDEM[@]}" slope "${in}" "${slope_tif}" \
+  run_gdal "${GDALDEM[@]}" slope "${in}" "${slope_tif}" \
     -compute_edges -co COMPRESS=DEFLATE -co TILED=YES -co BIGTIFF=YES
   cat > "${ramp}" <<'RAMP'
 0   255 255 255
 90    0   0   0
 RAMP
-  "${GDALDEM[@]}" color-relief "${slope_tif}" "${ramp}" "${out}" \
+  run_gdal "${GDALDEM[@]}" color-relief "${slope_tif}" "${ramp}" "${out}" \
     -co COMPRESS=DEFLATE -co TILED=YES -co BIGTIFF=YES
   rm -f "${slope_tif}" "${ramp}"
 }
@@ -195,7 +203,7 @@ with open(p, "w") as f: f.write(t.replace("</Document>", nl + "\n</Document>", 1
 # coverage means transparency is decoupled from grayscale values.
 reproject_to_wgs84() {
   local in="$1" out="$2"
-  "${GDALWARP[@]}" -t_srs EPSG:4326 -r bilinear \
+  run_gdal "${GDALWARP[@]}" -t_srs EPSG:4326 -r bilinear \
     -srcnodata 0 -dstalpha \
     -multi -wo NUM_THREADS=ALL_CPUS \
     -co COMPRESS=DEFLATE -co TILED=YES -co BIGTIFF=YES \
@@ -208,7 +216,7 @@ reproject_to_wgs84() {
 # NoData defaults, causing bright/dark seam artifacts at boundaries.
 build_dem_vrt() {
   local list_file="$1" out_vrt="$2"
-  "${GDALBUILDVRT[@]}" \
+  run_gdal "${GDALBUILDVRT[@]}" \
     -srcnodata "${DEM_NODATA}" -vrtnodata "${DEM_NODATA}" \
     -input_file_list "${list_file}" "${out_vrt}"
 }
