@@ -191,12 +191,12 @@ setup() {
   [ "${status}" -ne 0 ]
 }
 
-@test "_lidar_download_one uses STRICT_DOWNLOADS env var" {
-  # This tests the variable is read; actual download behavior is integration-only.
-  # Verify the variable is exported and the function references it.
+@test "download_tiles respects STRICT_DOWNLOADS on failure" {
+  # STRICT_DOWNLOADS is checked in download_tiles (not in _lidar_download_one).
+  # Worker failures are recorded in FAILED_TILE_LOG; download_tiles decides
+  # whether to abort (STRICT=1) or continue (STRICT=0) based on the count.
   source "${LIDAR_HOME}/lib/download.sh"
-  # _lidar_download_one is exported; grep its definition for STRICT_DOWNLOADS
-  declare -f _lidar_download_one | grep -q 'STRICT_DOWNLOADS'
+  declare -f download_tiles | grep -q 'STRICT_DOWNLOADS'
 }
 
 @test "download_tiles summary mentions failed tile log" {

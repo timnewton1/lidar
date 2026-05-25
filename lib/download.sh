@@ -190,8 +190,8 @@ _lidar_download_one() {
     # Record failure for the summary; FAILED_TILE_LOG is set by download_tiles.
     # flock on the log file itself makes the append race-safe across xargs workers.
     [[ -n "${FAILED_TILE_LOG:-}" ]] && flock "${FAILED_TILE_LOG}" -c "echo '${basename}' >> '${FAILED_TILE_LOG}'"
-    # Honour STRICT_DOWNLOADS: if set to 1, propagate the failure so xargs sees it.
-    [[ "${STRICT_DOWNLOADS:-0}" -eq 1 ]] && return 1
+    # STRICT_DOWNLOADS decision is made in download_tiles (by examining the
+    # failure count); we always return 1 here to signal xargs that this tile failed.
     return 1
   fi
   if [[ -f "${tile_tif}" ]]; then
@@ -239,11 +239,13 @@ download_tiles() {
     else
       echo "  Proceeding with $(( TOTAL_TILES - n_failed )) of ${TOTAL_TILES} tiles."
       echo "  Re-run the same command to retry failed tiles (cached tiles are skipped)."
+      rm -f "${failed_log}"
+      return 0
     fi
   else
     echo "STEP 4 complete — all ${TOTAL_TILES} tiles downloaded successfully"
   fi
   echo "=========================================="
   rm -f "${failed_log}"
-  return ${rc}
+  return 0
 }
