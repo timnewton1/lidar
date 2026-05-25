@@ -29,12 +29,14 @@
 #       --cog-no-reproject   keep source CRS even if geographic (warns; QGIS
 #                            3D Map View may not render geographic CRSes)
 #   -d, --dry-run            validate inputs and print resolved plan; exit 0
+#   --strict-downloads       abort the run if any tile fails to download
+#                            (default: proceed with successfully-downloaded tiles)
 #   -h, --help               show this help
 
 source "${LIDAR_HOME}/lib/strict.sh"
 
 usage() {
-  sed -n '3,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '3,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-1}"
 }
 
