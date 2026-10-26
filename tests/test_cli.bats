@@ -140,6 +140,37 @@ setup() {
   [[ "${row}" != *'"args":'* ]]
 }
 
+@test "Bug A: _on_project_exit captures \$? before re-entrancy guard" {
+  # Verify the fix is in place: local _rc=\$? must appear before the [[ check.
+  local src="${LIDAR_HOME}/libexec/lidar-run"
+  local rc_line guard_line
+  rc_line=$(grep -n 'local _rc=\$?' "${src}" | head -1 | cut -d: -f1)
+  guard_line=$(grep -n '\[\[ \${_on_exit_done}' "${src}" | head -1 | cut -d: -f1)
+  (( rc_line < guard_line ))
+}
+
+@test "Bug B: events_emit_start uses BASHPID not \$\$" {
+  grep -q '\$BASHPID' "${LIDAR_HOME}/lib/events.sh"
+  ! grep -qP '"pid":%d.*\$\$' "${LIDAR_HOME}/lib/events.sh"
+}
+
+@test "Bug B: events_emit_start not called in pre-fork loop in lidar-run" {
+  local src="${LIDAR_HOME}/libexec/lidar-run"
+  # All events_emit_start calls must be inside _run_one_project, not in the
+  # pre-fork dispatch loop. Guard: no calls should appear after the line
+  # that defines _HEXES=() (start of pre-fork loop) and before the supervisor
+  # subshell comment.
+  local hexes_line supervisor_line
+  hexes_line=$(grep -n 'declare -a _HEXES' "${src}" | head -1 | cut -d: -f1)
+  supervisor_line=$(grep -n '^# Supervisor subshell' "${src}" | head -1 | cut -d: -f1)
+  # If any events_emit_start call falls in [hexes_line, supervisor_line], fail
+  local found=0
+  while IFS= read -r ln; do
+    (( ln >= hexes_line && ln <= supervisor_line )) && found=1
+  done < <(grep -n 'events_emit_start' "${src}" | cut -d: -f1)
+  (( found == 0 ))
+}
+
 # ─── Fan-out flags ────────────────────────────────────────────────────────────
 
 @test "lidar run --background flag rejected" {
@@ -230,6 +261,17 @@ setup() {
 # in the run pipeline must explicitly pick a base on the output disk via
 # -p or -d <basedir>. A bare `mktemp` or `mktemp --suffix=...` lands in
 # $TMPDIR (default /tmp) and is a silent OOM trap.
+@test "lidar run --strict-downloads flag is accepted" {
+  run bash -c "\"${LIDAR}\" run --strict-downloads --dry-run \"${FIXTURES}/one_tile.txt\" 2>&1 || true"
+  [[ "${output}" != *"Unknown flag"* ]]
+  [[ "${output}" != *"unknown flag"* ]]
+}
+
+@test "lidar run --strict-downloads appears in dry-run plan" {
+  run bash -c "\"${LIDAR}\" run --strict-downloads --dry-run \"${FIXTURES}/one_tile.txt\" 2>&1 || true"
+  [[ "${output}" == *"strict_downloads=1"* ]]
+}
+
 @test "no mktemp in run pipeline targets default TMPDIR" {
   # Every mktemp invocation must reference one of the output-disk path
   # variables (LIDAR_DIR, WORK_DIR, _proj_work) — either via -p/-d or in

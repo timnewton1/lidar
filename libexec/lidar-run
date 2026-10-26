@@ -29,12 +29,14 @@
 #       --cog-no-reproject   keep source CRS even if geographic (warns; QGIS
 #                            3D Map View may not render geographic CRSes)
 #   -d, --dry-run            validate inputs and print resolved plan; exit 0
+#   --strict-downloads       abort the run if any tile fails to download
+#                            (default: proceed with successfully-downloaded tiles)
 #   -h, --help               show this help
 
 source "${LIDAR_HOME}/lib/strict.sh"
 
 usage() {
-  sed -n '3,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '3,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-1}"
 }
 
@@ -48,6 +50,7 @@ ALGORITHM=""
 MULTIDIRECTIONAL=0
 JOBS_OVERRIDE=""
 DRY_RUN=0
+STRICT_DOWNLOADS=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -59,6 +62,7 @@ while [[ $# -gt 0 ]]; do
     -o|--output)           OUTPUTS_CSV="$2"; shift 2 ;;
     --cog-crs)             COG_CRS="$2"; shift 2 ;;
     --cog-no-reproject)    COG_NO_REPROJECT=1; shift ;;
+    --strict-downloads)    STRICT_DOWNLOADS=1; shift ;;
     -d|--dry-run)          DRY_RUN=1; shift ;;
     -h|--help)             usage 0 ;;
     -*)                    echo "Unknown flag: $1" >&2; usage ;;
@@ -116,6 +120,7 @@ if [[ -n "${JOBS_OVERRIDE}" ]]; then
 fi
 
 [[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
+export STRICT_DOWNLOADS
 
 source "${LIDAR_HOME}/lib/common.sh"
 source "${LIDAR_HOME}/lib/events.sh"
@@ -123,6 +128,7 @@ source "${LIDAR_HOME}/lib/download.sh"
 source "${LIDAR_HOME}/lib/gdal.sh"
 source "${LIDAR_HOME}/lib/kml.sh"
 source "${LIDAR_HOME}/lib/cog.sh"
+source "${LIDAR_HOME}/lib/diag.sh"
 
 [[ ${#INPUTS[@]} -eq 0 ]] && usage
 
@@ -209,6 +215,7 @@ if [[ ${DRY_RUN} -eq 1 ]]; then
   echo "Shadings    : ${SHADINGS[*]}"
   echo "Algorithm   : ${HS_ALGORITHM} (multidirectional=${HS_MULTIDIRECTIONAL})"
   echo "Outputs     : ${OUTPUTS_PLAN% }"
+  echo "strict_downloads=${STRICT_DOWNLOADS}"
   if [[ ${OUTPUT_COG} -eq 1 ]]; then
     if [[ -n "${COG_CRS}" ]]; then
       echo "COG CRS     : ${COG_CRS} (explicit)"
@@ -251,6 +258,8 @@ _run_one_project() {
   local _log="${_log_dir}/${_hex}.log"
   mkdir -p "${_log_dir}"
   exec > "${_log}" 2>&1
+  events_emit_start "${_hex}" "${_log}" "${_project}" "${INPUTS[@]}"
+  diag_pre_run "${PROJECTS_DIR}/${_project}"
 
   local _proj_work; _proj_work=$(mktemp -d "${LIDAR_DIR}/.work_XXXXXX")
   WORK_DIR="${_proj_work}"
@@ -267,8 +276,19 @@ _run_one_project() {
 
   local _on_exit_done=0
   _on_project_exit() {
-    [[ ${_on_exit_done} -eq 1 ]] && return; _on_exit_done=1
     local _rc=$?
+    [[ ${_on_exit_done} -eq 1 ]] && return; _on_exit_done=1
+    echo "=========================================="
+    if [[ ${_rc} -eq 0 ]]; then
+      : # normal exit; ALL DONE banner already printed above
+    elif [[ ${_rc} -gt 128 ]]; then
+      local _sig=$(( _rc - 128 ))
+      local _signame; _signame=$(kill -l "${_sig}" 2>/dev/null || echo "${_sig}")
+      echo "EXIT: $(signal_exit_reason "${_signame}") (signal ${_signame}, exit ${_rc})"
+    else
+      echo "EXIT: failed with exit code ${_rc}"
+    fi
+    echo "=========================================="
     events_emit_end "${_hex}" "${_rc}"
     rm -rf "${_proj_work}"
   }
@@ -418,7 +438,7 @@ _run_one_project() {
         { read -r MAX_ZOOM; read -r LK_LON LK_LAT LK_RANGE; } \
           < <(compute_zoom_and_lookat "${WGS84_TIF}") || true
         echo "  Zoom range: 0-${MAX_ZOOM} (min=world, max=native resolution)"
-        "${GDAL[@]}" raster tile \
+        run_gdal "${GDAL[@]}" raster tile \
           --tiling-scheme WorldCRS84Quad \
           --kml \
           --webviewer none \
@@ -518,18 +538,17 @@ _run_one_project() {
   echo "=========================================="
 }
 
-# ─── Generate hex IDs, emit start events, dispatch ───────────────────────────
+# ─── Generate hex IDs and dispatch ───────────────────────────────────────────
 mkdir -p "${LIDAR_DIR}/logs"
 
 declare -a _HEXES=()
 for (( _i=0; _i<_N_PROJECTS; _i++ )); do
   _hex=$(gen_hex_id)
   _HEXES+=("${_hex}")
-  events_emit_start "${_hex}" "${LIDAR_DIR}/logs/${_hex}.log" \
-    "${_FANOUT_PROJECTS[_i]}" "${INPUTS[@]}"
 done
 
 echo "Dispatching ${_N_PROJECTS} run(s) (jobs=${JOBS})..."
+echo "  System: $(diag_system_snapshot "${GIS_DIR}")"
 for (( _i=0; _i<_N_PROJECTS; _i++ )); do
   printf "  [%d/%d] %s  →  %s\n" \
     "$((_i+1))" "${_N_PROJECTS}" \

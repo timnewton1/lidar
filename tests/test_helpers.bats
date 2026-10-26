@@ -147,3 +147,89 @@ setup() {
   [[ "${result}" == *"Alpha_2020"* ]]
   [[ "${result}" == *"Beta_2021"* ]]
 }
+
+@test "diag_system_snapshot prints disk available" {
+  source "${LIDAR_HOME}/lib/diag.sh"
+  result=$(diag_system_snapshot "${BATS_TMPDIR}")
+  [[ "${result}" == *"disk_avail"* ]]
+}
+
+@test "diag_system_snapshot prints ram_avail_mb" {
+  source "${LIDAR_HOME}/lib/diag.sh"
+  result=$(diag_system_snapshot "${BATS_TMPDIR}")
+  [[ "${result}" == *"ram_avail_mb"* ]]
+}
+
+@test "diag_system_snapshot prints tmpfs_avail" {
+  source "${LIDAR_HOME}/lib/diag.sh"
+  result=$(diag_system_snapshot "${BATS_TMPDIR}")
+  [[ "${result}" == *"tmpfs_avail"* ]]
+}
+
+@test "diag_pre_run prints GDAL_FLATPAK_APP" {
+  source "${LIDAR_HOME}/lib/diag.sh"
+  result=$(diag_pre_run "${BATS_TMPDIR}" 2>&1 || true)
+  [[ "${result}" == *"${GDAL_FLATPAK_APP}"* ]]
+}
+
+@test "signal_exit_reason explains SIGINT" {
+  source "${LIDAR_HOME}/lib/diag.sh"
+  result=$(signal_exit_reason INT)
+  [[ "${result}" == *"SIGINT"* ]]
+}
+
+@test "signal_exit_reason explains SIGHUP" {
+  source "${LIDAR_HOME}/lib/diag.sh"
+  result=$(signal_exit_reason HUP)
+  [[ "${result}" == *"SIGHUP"* ]]
+}
+
+@test "signal_exit_reason for SIGTERM names the signal and never guesses OOM" {
+  # OOM-kills use SIGKILL (untrappable) and can't reach the exit trap, so the
+  # reason for a caught TERM must not claim OOM. On a normally-running test
+  # host the system is not "stopping", so this exercises the generic branch.
+  source "${LIDAR_HOME}/lib/diag.sh"
+  result=$(signal_exit_reason TERM)
+  [[ "${result}" == *"SIGTERM"* ]]
+  [[ "${result}" != *"OOM"* ]]
+}
+
+@test "signal_exit_reason falls back for an unnamed signal" {
+  source "${LIDAR_HOME}/lib/diag.sh"
+  result=$(signal_exit_reason USR1)
+  [[ "${result}" == *"USR1"* ]]
+}
+
+@test "run_gdal logs the command before running it" {
+  source "${LIDAR_HOME}/lib/gdal.sh"
+  # Use 'true' as a stand-in GDAL command — we're testing the logging, not GDAL
+  result=$(run_gdal true --some-flag /input /output 2>&1)
+  [[ "${result}" == *"true --some-flag /input /output"* ]]
+}
+
+@test "run_gdal executes the command" {
+  source "${LIDAR_HOME}/lib/gdal.sh"
+  run run_gdal true
+  [ "${status}" -eq 0 ]
+}
+
+@test "run_gdal propagates non-zero exit" {
+  source "${LIDAR_HOME}/lib/gdal.sh"
+  run run_gdal false
+  [ "${status}" -ne 0 ]
+}
+
+@test "download_tiles respects STRICT_DOWNLOADS on failure" {
+  # STRICT_DOWNLOADS is checked in download_tiles (not in _lidar_download_one).
+  # Worker failures are recorded in FAILED_TILE_LOG; download_tiles decides
+  # whether to abort (STRICT=1) or continue (STRICT=0) based on the count.
+  source "${LIDAR_HOME}/lib/download.sh"
+  declare -f download_tiles | grep -q 'STRICT_DOWNLOADS'
+}
+
+@test "download_tiles summary mentions failed tile log" {
+  # We can't run real downloads in bats; test that the summary logic exists
+  # by checking download_tiles' source references FAILED_TILE_LOG.
+  source "${LIDAR_HOME}/lib/download.sh"
+  declare -f download_tiles | grep -q 'FAILED_TILE_LOG'
+}
