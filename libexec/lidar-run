@@ -284,7 +284,7 @@ _run_one_project() {
     elif [[ ${_rc} -gt 128 ]]; then
       local _sig=$(( _rc - 128 ))
       local _signame; _signame=$(kill -l "${_sig}" 2>/dev/null || echo "${_sig}")
-      echo "EXIT: killed by signal ${_signame} (exit ${_rc}) — likely OOM-kill or systemd timeout"
+      echo "EXIT: $(signal_exit_reason "${_signame}") (signal ${_signame}, exit ${_rc})"
     else
       echo "EXIT: failed with exit code ${_rc}"
     fi

@@ -172,6 +172,34 @@ setup() {
   [[ "${result}" == *"${GDAL_FLATPAK_APP}"* ]]
 }
 
+@test "signal_exit_reason explains SIGINT" {
+  source "${LIDAR_HOME}/lib/diag.sh"
+  result=$(signal_exit_reason INT)
+  [[ "${result}" == *"SIGINT"* ]]
+}
+
+@test "signal_exit_reason explains SIGHUP" {
+  source "${LIDAR_HOME}/lib/diag.sh"
+  result=$(signal_exit_reason HUP)
+  [[ "${result}" == *"SIGHUP"* ]]
+}
+
+@test "signal_exit_reason for SIGTERM names the signal and never guesses OOM" {
+  # OOM-kills use SIGKILL (untrappable) and can't reach the exit trap, so the
+  # reason for a caught TERM must not claim OOM. On a normally-running test
+  # host the system is not "stopping", so this exercises the generic branch.
+  source "${LIDAR_HOME}/lib/diag.sh"
+  result=$(signal_exit_reason TERM)
+  [[ "${result}" == *"SIGTERM"* ]]
+  [[ "${result}" != *"OOM"* ]]
+}
+
+@test "signal_exit_reason falls back for an unnamed signal" {
+  source "${LIDAR_HOME}/lib/diag.sh"
+  result=$(signal_exit_reason USR1)
+  [[ "${result}" == *"USR1"* ]]
+}
+
 @test "run_gdal logs the command before running it" {
   source "${LIDAR_HOME}/lib/gdal.sh"
   # Use 'true' as a stand-in GDAL command — we're testing the logging, not GDAL

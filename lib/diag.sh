@@ -51,3 +51,35 @@ diag_pre_run() {
   fi
   echo "=========================================="
 }
+
+# Explain why a signal-based exit happened, for the run log's EXIT banner.
+# Args: <signame>   the signal name without the SIG prefix (TERM, INT, HUP)
+#                   or a raw number if `kill -l` could not name it.
+# Echoes a one-line human-readable reason. Best-effort; never fails.
+#
+# A bare SIGTERM is ambiguous on its own — it could be a manual kill, a
+# `lidar kill`, a systemd unit stop, or the broadcast systemd sends to every
+# process during shutdown/reboot. We can pin down the reboot case: systemd
+# reports the whole system as "stopping" for the entire shutdown grace
+# window, so a TERM arriving while `is-system-running` says "stopping" is the
+# reboot — not a targeted kill. Note an OOM-kill never reaches this trap at
+# all: the kernel uses SIGKILL, which is untrappable, so we must NOT guess
+# "OOM" for a signal we were able to catch.
+signal_exit_reason() {
+  local signame="$1"
+  case "${signame}" in
+    INT) echo "interrupted (SIGINT / Ctrl-C)"; return 0 ;;
+    HUP) echo "terminal hangup (SIGHUP)"; return 0 ;;
+    TERM)
+      local sys=""
+      command -v systemctl >/dev/null 2>&1 && sys=$(systemctl is-system-running 2>/dev/null || true)
+      if [[ "${sys}" == "stopping" ]]; then
+        echo "SIGTERM from system shutdown/reboot in progress"
+      else
+        echo "SIGTERM from outside the run (manual kill, lidar kill, or systemd stop/timeout)"
+      fi
+      return 0
+      ;;
+    *) echo "killed by signal ${signame}"; return 0 ;;
+  esac
+}
