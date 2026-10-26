@@ -10,15 +10,13 @@
 #   -n, --lines N        show last N lines (default: all)
 #   --no-follow          use pager even for running logs
 #   --pager CMD          pager for completed logs (default: less)
-#   --gis-dir PATH       override GIS_DIR
 #   -h, --help           show this help
 
 source "${LIDAR_HOME}/lib/strict.sh"
 
-usage() { sed -n '3,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+usage() { sed -n '3,/^[^#]/{/^#/p}' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
 
 LINES=""
-GIS_DIR_OVERRIDE=""
 TARGET=""
 NO_FOLLOW=0
 PAGER_CMD=""
@@ -28,7 +26,6 @@ while [[ $# -gt 0 ]]; do
     -n|--lines)    LINES="$2"; shift 2 ;;
     --no-follow)   NO_FOLLOW=1; shift ;;
     --pager)       PAGER_CMD="$2"; shift 2 ;;
-    --gis-dir)     GIS_DIR_OVERRIDE="$2"; shift 2 ;;
     -h|--help)     usage 0 ;;
     -*)            echo "Unknown flag: $1" >&2; usage ;;
     *)             [[ -n "${TARGET}" ]] && { echo "Too many arguments" >&2; usage; }
@@ -36,7 +33,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
 source "${LIDAR_HOME}/lib/common.sh"
 source "${LIDAR_HOME}/lib/events.sh"
 
@@ -70,7 +66,7 @@ fi
 RUN_ID=$(resolve_run_id "${TARGET}") || exit 1
 
 LOG_PATH=$(jq -rs --arg id "${RUN_ID}" '
-  .[] | select(.id == $id and .event == "start") | .log // ""
+  [ .[] | select(.id == $id and .event == "start") ] | last | .log // ""
 ' "${EVENTS_FILE}" 2>/dev/null || echo "")
 
 if [[ -z "${LOG_PATH}" || "${LOG_PATH}" == "null" || ! -f "${LOG_PATH}" ]]; then
@@ -82,17 +78,8 @@ if [[ ! -f "${LOG_PATH}" ]]; then
   exit 1
 fi
 
-PID=$(jq -rs --arg id "${RUN_ID}" '
-  .[] | select(.id == $id and .event == "start") | .pid // 0
-' "${EVENTS_FILE}" 2>/dev/null || echo 0)
-DONE=$(jq -rs --arg id "${RUN_ID}" '
-  [ .[] | select(.id == $id and .event == "end") ] | length > 0
-' "${EVENTS_FILE}" 2>/dev/null || echo "false")
-
 RUNNING=0
-if [[ "${DONE}" == "false" && -n "${PID}" && "${PID}" != "0" ]]; then
-  kill -0 "${PID}" 2>/dev/null && RUNNING=1 || true
-fi
+run_is_active "${RUN_ID}" && RUNNING=1
 
 if [[ ${RUNNING} -eq 1 && ${NO_FOLLOW} -eq 0 ]]; then
   _tf=(-F)

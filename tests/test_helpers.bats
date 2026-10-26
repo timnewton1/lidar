@@ -166,10 +166,30 @@ setup() {
   [[ "${result}" == *"tmpfs_avail"* ]]
 }
 
-@test "diag_pre_run prints GDAL_FLATPAK_APP" {
+@test "diag_pre_run prints the GDAL version" {
   source "${LIDAR_HOME}/lib/diag.sh"
   result=$(diag_pre_run "${BATS_TMPDIR}" 2>&1 || true)
-  [[ "${result}" == *"${GDAL_FLATPAK_APP}"* ]]
+  [[ "${result}" == *"GDAL version: GDAL 3."* ]]
+}
+
+@test "run_is_active matches whole ids from LIDAR_ACTIVE only" {
+  source "${LIDAR_HOME}/lib/events.sh"
+  LIDAR_ACTIVE="abc123 def456" run_is_active abc123
+  LIDAR_ACTIVE="abc123 def456" run_is_active def456
+  ! LIDAR_ACTIVE="abc123" run_is_active abc
+  ! LIDAR_ACTIVE="" run_is_active abc123
+}
+
+@test "job_write spec sources back into the same values" {
+  source "${LIDAR_HOME}/lib/jobs.sh"
+  local urls="${GIS_DIR}/lidar/t.urls"; echo "https://x/Projects/P/a.tif" > "${urls}"
+  JOBS=2 INPUTS=("a b.txt") SHADINGS=(hillshade slopeshade) OUTPUT_KML=1 OUTPUT_KMZ=0
+  OUTPUT_COG=1 NEED_PYRAMID=1 COG_CRS="EPSG:32612" COG_NO_REPROJECT=0
+  HS_ALGORITHM=Horn HS_MULTIDIRECTIONAL=0 STRICT_DOWNLOADS=1 extra_deps=(python3)
+  job_write ab12cd "My Project" bat001 "${urls}"
+  run bash -c "source '$(job_env ab12cd)'; echo \"\${JOB_PROJECT}|\${JOB_BATCH}|\${INPUTS[0]}|\${SHADINGS[1]}|\${COG_CRS}|\${extra_deps[*]}\""
+  [ "${output}" = "My Project|bat001|a b.txt|slopeshade|EPSG:32612|python3" ]
+  cmp "${urls}" "$(job_urls ab12cd)"
 }
 
 @test "signal_exit_reason explains SIGINT" {
@@ -186,8 +206,7 @@ setup() {
 
 @test "signal_exit_reason for SIGTERM names the signal and never guesses OOM" {
   # OOM-kills use SIGKILL (untrappable) and can't reach the exit trap, so the
-  # reason for a caught TERM must not claim OOM. On a normally-running test
-  # host the system is not "stopping", so this exercises the generic branch.
+  # reason for a caught TERM must not claim OOM.
   source "${LIDAR_HOME}/lib/diag.sh"
   result=$(signal_exit_reason TERM)
   [[ "${result}" == *"SIGTERM"* ]]
@@ -232,4 +251,11 @@ setup() {
   # by checking download_tiles' source references FAILED_TILE_LOG.
   source "${LIDAR_HOME}/lib/download.sh"
   declare -f download_tiles | grep -q 'FAILED_TILE_LOG'
+}
+
+@test "diag_pre_run survives an output dir that does not exist yet" {
+  source "${LIDAR_HOME}/lib/diag.sh"
+  run diag_pre_run "${BATS_TMPDIR}/no/such/dir"
+  [ "${status}" -eq 0 ]
+  [[ "${output}" == *"disk_avail="* ]]
 }

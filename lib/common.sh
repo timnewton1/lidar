@@ -2,8 +2,10 @@
 # Shared state, defaults, and pure helpers for the lidar pipeline.
 # Source this file; do not execute it directly.
 #
-# Required (must be set before sourcing OR via --gis-dir in the caller):
-#   GIS_DIR — root GIS data directory (e.g. /mnt/data/gis)
+# Required:
+#   GIS_DIR — root GIS data directory (e.g. /mnt/data/gis). Inside the
+#             container it comes from ~/.config/lidar/lidar.env via the host
+#             wrapper or the lidar@ quadlet.
 
 [[ -n "${_LIDAR_COMMON_LOADED:-}" ]] && return 0
 _LIDAR_COMMON_LOADED=1
@@ -11,9 +13,7 @@ _LIDAR_COMMON_LOADED=1
 # strict.sh must be loaded first by the entry script.
 
 if [[ -z "${GIS_DIR:-}" ]]; then
-  echo "ERROR: GIS_DIR is not set." >&2
-  echo "  Either: export GIS_DIR=/path/to/gis" >&2
-  echo "  Or pass: --gis-dir /path/to/gis" >&2
+  echo "ERROR: GIS_DIR is not set (set it in ~/.config/lidar/lidar.env; see lidar install)." >&2
   exit 1
 fi
 
@@ -23,16 +23,16 @@ DEM_DIR="${LIDAR_DIR}/tiles/dem"
 EVENTS_FILE="${LIDAR_DIR}/logs/runs.jsonl"
 PROJECTS_DIR="${LIDAR_DIR}/projects"
 
-# ─── GDAL via QGIS flatpak ───────────────────────────────────────────────────
-# Migrated from gdal2tiles.py to `gdal raster tile` (GDAL 3.11+). gdal2tiles.py
-# is deprecated in GDAL 3.13 and removed in 3.15.
-GDAL_FLATPAK_APP="org.qgis.qgis"
-GDAL=(flatpak          run --command=gdal           "${GDAL_FLATPAK_APP}")
-GDALDEM=(flatpak       run --command=gdaldem        "${GDAL_FLATPAK_APP}")
-GDALINFO=(flatpak      run --command=gdalinfo       "${GDAL_FLATPAK_APP}")
-GDALWARP=(flatpak      run --command=gdalwarp       "${GDAL_FLATPAK_APP}")
-GDALBUILDVRT=(flatpak  run --command=gdalbuildvrt   "${GDAL_FLATPAK_APP}")
-GDALTRANSLATE=(flatpak run --command=gdal_translate "${GDAL_FLATPAK_APP}")
+# ─── GDAL (from the container image; see Containerfile) ─────────────────────
+# Kept as arrays so every call site goes through one indirection point, which
+# run_gdal logs. Migrated from gdal2tiles.py to `gdal raster tile` (GDAL
+# 3.11+); gdal2tiles.py is deprecated in GDAL 3.13 and removed in 3.15.
+GDAL=(gdal)
+GDALDEM=(gdaldem)
+GDALINFO=(gdalinfo)
+GDALWARP=(gdalwarp)
+GDALBUILDVRT=(gdalbuildvrt)
+GDALTRANSLATE=(gdal_translate)
 
 # GDAL 3.10+ defaults block cache to this percentage of usable RAM per job.
 # lidar-run uses this same value for its MemAvailable gate so the throttle

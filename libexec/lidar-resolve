@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# `lidar resolve <query>...` — print the full run id for each hex prefix.
+#
+# Internal: the host wrapper uses it to turn user input into lidar@<id> unit
+# names for kill/restart. Exits non-zero (message on stderr) on no match or
+# an ambiguous prefix.
+
+source "${LIDAR_HOME}/lib/strict.sh"
+source "${LIDAR_HOME}/lib/common.sh"
+source "${LIDAR_HOME}/lib/events.sh"
+
+[[ $# -gt 0 ]] || { echo "usage: lidar resolve <hex>..." >&2; exit 2; }
+for q in "$@"; do resolve_run_id "${q}"; done
