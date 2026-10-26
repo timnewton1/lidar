@@ -12,21 +12,18 @@
 #   <name|hex>    run name or hex suffix — tile list is extracted from the run log
 #
 # Options:
-#   --gis-dir PATH   override GIS_DIR
 #   --sample N       tiles to HEAD-sample for pending estimate (default 5)
 #   -h, --help       show this help
 
 source "${LIDAR_HOME}/lib/strict.sh"
 
-usage() { sed -n '3,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+usage() { sed -n '3,/^[^#]/{/^#/p}' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
 
-GIS_DIR_OVERRIDE=""
 TILE_LIST=""
 SAMPLE_N=5
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --gis-dir)  GIS_DIR_OVERRIDE="$2"; shift 2 ;;
     --sample)   SAMPLE_N="$2"; shift 2 ;;
     -h|--help)  usage 0 ;;
     -*)         echo "Unknown flag: $1" >&2; usage ;;
@@ -37,7 +34,6 @@ done
 
 [[ -z "${TILE_LIST}" ]] && usage
 
-[[ -n "${GIS_DIR_OVERRIDE}" ]] && export GIS_DIR="${GIS_DIR_OVERRIDE}"
 source "${LIDAR_HOME}/lib/common.sh"
 source "${LIDAR_HOME}/lib/events.sh"
 

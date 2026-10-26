@@ -1,0 +1,28 @@
+# One lidar pipeline run per instance: lidar@<hex>.service.
+#
+# Started by `lidar run` (never enabled; no [Install]). The job spec it runs
+# lives at ${GIS_DIR}/lidar/jobs/<hex>.env, written by the dispatcher.
+# ${LIDAR_REPO} and ${GIS_DIR} come from ~/.config/lidar/lidar.env, which
+# `lidar install` writes; systemd expands them in the generated ExecStart.
+[Unit]
+Description=lidar run %i
+
+[Container]
+Image=localhost/lidar:latest
+Pull=never
+ContainerName=lidar-%i
+Label=lidar.run=%i
+Environment=GIS_DIR=${GIS_DIR}
+# Repo is code, mounted read-only; z because it lives under $HOME
+# (user_home_t). The data disk is already container_file_t, so no relabel.
+Volume=${LIDAR_REPO}:/opt/lidar:ro,z
+Volume=${GIS_DIR}:${GIS_DIR}
+Exec=worker %i
+# Worker forwards TERM to its whole process group and then writes the end
+# event; GDAL exits fast on TERM, so 30s is plenty before podman SIGKILLs.
+StopTimeout=30
+
+[Service]
+EnvironmentFile=%h/.config/lidar/lidar.env
+Restart=no
+TimeoutStopSec=60

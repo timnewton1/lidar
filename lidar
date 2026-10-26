@@ -1,16 +1,236 @@
 #!/usr/bin/env bash
+# `lidar` — host front end. The pipeline itself only ever runs inside the
+# lidar container image (GDAL comes from there). This script stages local
+# input files onto the data disk, runs short-lived containers for planning
+# and reporting, and drives one lidar@<hex> systemd unit per run.
 set -Eeuo pipefail
-HERE=$(cd "$(dirname "$(realpath "$0")")" && pwd)
-export LIDAR_HOME="${HERE}"
-export PATH="${HERE}/libexec:${PATH}"
+
+REPO=$(cd "$(dirname "$(realpath "$0")")" && pwd)
+CONF_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/lidar"
+CONF="${CONF_DIR}/lidar.env"
+QUADLET_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/containers/systemd"
+IMAGE=localhost/lidar:latest
+
+usage() {
+  cat <<'EOF'
+Usage: lidar <subcommand> [options...]
+
+Runs:
+  run <list.txt|URL>...  Download tiles, mosaic, derive shading, build outputs
+  list [<hex>]           List runs, or follow/page one run's log
+  size <list|hex>        Estimate download size for a tile list or run
+  kill <hex>... | --all  Stop running pipeline(s)
+  restart <hex>...       Re-run a run in place (same hex, same flags)
+
+Setup:
+  install [--gis-dir P]  Write ~/.config/lidar/lidar.env, link the quadlet and
+                         this command into place, build the image if missing
+  build                  (Re)build the container image (only after Containerfile changes)
+  test                   Run the bats suite inside the image
+  help                   Show this help
+
+Run `lidar <subcommand> --help` for per-subcommand flags.
+Each run is a systemd user unit: journalctl --user -u lidar@<hex>
+EOF
+  exit "${1:-0}"
+}
+
+die() { echo "lidar: $*" >&2; exit 1; }
+
+load_conf() {
+  [[ -f "${CONF}" ]] || die "not installed — run: lidar install"
+  # shellcheck source=/dev/null
+  source "${CONF}"
+  # Never create it: a missing dir almost always means the data drive isn't
+  # mounted, and writing into the empty mountpoint would hide that.
+  [[ -d "${GIS_DIR}/lidar" ]] || die "${GIS_DIR}/lidar not found — is the data drive mounted?"
+  podman image exists "${IMAGE}" || die "image ${IMAGE} missing — run: lidar build"
+}
+
+# Ids of lidar@ units systemd considers alive; the container can't see them.
+active_ids() {
+  systemctl --user list-units 'lidar@*.service' --plain --no-legend \
+    --state=active,activating,deactivating 2>/dev/null \
+    | awk '{ sub(/^lidar@/, "", $1); sub(/\.service$/, "", $1); print $1 }' \
+    | tr '\n' ' '
+}
+
+# in_container [-t] <sub> [args...] — one-shot container with the same mounts
+# as the quadlet. -t allocates a TTY (pagers, colors); omit it when the
+# output is captured, or it arrives with CRLF line endings.
+in_container() {
+  local tty=()
+  if [[ "${1:-}" == -t ]]; then
+    shift
+    [[ -t 0 && -t 1 ]] && tty=(-t)
+  fi
+  podman run --rm -i "${tty[@]+"${tty[@]}"}" \
+    -v "${LIDAR_REPO}:/opt/lidar:ro,z" \
+    -v "${GIS_DIR}:${GIS_DIR}" \
+    -e GIS_DIR="${GIS_DIR}" \
+    -e LIDAR_ACTIVE="$(active_ids)" \
+    -e TERM -e LIDAR_PAGER \
+    "${IMAGE}" "$@"
+}
+
+# stage_args <dest_dir> <value-flag>... -- <arg>...
+# Copies every positional that is a local file into dest_dir (which the
+# container can see) and prints the rewritten arg list, NUL-separated. Values
+# of the named flags are passed through untouched. Basenames are preserved:
+# `lidar run` derives the fallback project name from the first list's name.
+stage_args() {
+  local dest="$1"; shift
+  local -A takes_value=()
+  while [[ "$1" != -- ]]; do takes_value["$1"]=1; shift; done
+  shift
+  while [[ $# -gt 0 ]]; do
+    if [[ -n "${takes_value[$1]:-}" && $# -ge 2 ]]; then
+      printf '%s\0%s\0' "$1" "$2"; shift 2; continue
+    fi
+    if [[ "$1" != -* && -f "$1" ]]; then
+      mkdir -p "${dest}"
+      [[ -e "${dest}/$(basename "$1")" ]] && die "two inputs named $(basename "$1")"
+      cp "$1" "${dest}/"
+      printf '%s\0' "${dest}/$(basename "$1")"
+    else
+      printf '%s\0' "$1"
+    fi
+    shift
+  done
+}
+
+cmd_run() {
+  load_conf
+  # Staged lists are kept: the run's events record their path, and
+  # `lidar size <hex>` reads the list back from there.
+  local dest; dest="${GIS_DIR}/lidar/inputs/$(date +%Y%m%d-%H%M%S)-$$"
+  local args=()
+  mapfile -d '' -t args < <(stage_args "${dest}" \
+    -s --shading -a --algorithm -j --jobs -o --output --cog-crs -- "$@")
+
+  local out rc=0
+  out=$(in_container run "${args[@]+"${args[@]}"}") || rc=$?
+  local line hexes=()
+  while IFS= read -r line; do
+    if [[ "${line}" == '@job '* ]]; then hexes+=("${line#@job }"); else printf '%s\n' "${line}"; fi
+  done <<< "${out}"
+  # Validation failures and --dry-run never stage anything worth keeping.
+  [[ ${#hexes[@]} -eq 0 ]] && rm -rf "${dest}"
+  [[ ${rc} -eq 0 ]] || exit "${rc}"
+
+  # Previous failed runs leave failed units behind; clear them so
+  # `systemctl --user --failed` reflects only the current state.
+  systemctl --user reset-failed 'lidar@*.service' 2>/dev/null || true
+  local hex
+  for hex in "${hexes[@]+"${hexes[@]}"}"; do
+    systemctl --user start --no-block "lidar@${hex}.service"
+  done
+}
+
+cmd_size() {
+  load_conf
+  # Unlike run, a size check leaves nothing behind. Global, not local: the
+  # EXIT trap fires after this function has returned.
+  SIZE_DEST=$(mktemp -d "${GIS_DIR}/lidar/.size_XXXXXX")
+  trap 'rm -rf "${SIZE_DEST}"' EXIT
+  local args=()
+  mapfile -d '' -t args < <(stage_args "${SIZE_DEST}" --sample -- "$@")
+  in_container -t size "${args[@]+"${args[@]}"}"
+}
+
+cmd_kill() {
+  case "${1:-}" in
+    -h|--help|"")
+      echo "Usage: lidar kill <hex>... | --all"
+      echo "Stops the lidar@<hex> unit(s); the run logs why and records its exit."
+      [[ -n "${1:-}" ]] && exit 0 || exit 2 ;;
+  esac
+  load_conf
+  local units=()
+  if [[ "$1" == --all ]]; then
+    [[ $# -eq 1 ]] || die "--all and run ids are mutually exclusive"
+    local id
+    for id in $(active_ids); do units+=("lidar@${id}.service"); done
+    [[ ${#units[@]} -gt 0 ]] || { echo "Nothing to kill."; exit 0; }
+  else
+    local ids id
+    ids=$(in_container resolve "$@") || exit 1
+    for id in ${ids}; do
+      [[ " $(active_ids) " == *" ${id} "* ]] || die "${id} is not running"
+      units+=("lidar@${id}.service")
+    done
+  fi
+  echo "Stopping: ${units[*]}"
+  systemctl --user stop "${units[@]}"
+}
+
+cmd_restart() {
+  case "${1:-}" in
+    -h|--help|"")
+      echo "Usage: lidar restart <hex>..."
+      echo "Re-runs each run in place: same hex, same flags, same tiles."
+      echo "Stops it first if running, and replaces that run's previous output."
+      [[ -n "${1:-}" ]] && exit 0 || exit 2 ;;
+  esac
+  load_conf
+  local ids id
+  ids=$(in_container resolve "$@") || exit 1
+  for id in ${ids}; do
+    [[ -f "${GIS_DIR}/lidar/jobs/${id}.env" ]] \
+      || die "${id} has no job spec (it predates containerized runs) — re-run it with: lidar run"
+  done
+  systemctl --user reset-failed 'lidar@*.service' 2>/dev/null || true
+  for id in ${ids}; do
+    echo "Restarting ${id}"
+    systemctl --user restart --no-block "lidar@${id}.service"
+  done
+}
+
+cmd_build() {
+  # The image holds no code (the repo is bind-mounted), so the build context
+  # is empty — see .containerignore.
+  podman build -t "${IMAGE}" -f "${REPO}/Containerfile" "${REPO}"
+}
+
+cmd_test() {
+  load_conf
+  podman run --rm -v "${LIDAR_REPO}:/opt/lidar:ro,z" --entrypoint bats "${IMAGE}" /opt/lidar/tests
+}
+
+cmd_install() {
+  local gis="${GIS_DIR:-}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --gis-dir) gis="$2"; shift 2 ;;
+      -h|--help) echo "Usage: lidar install [--gis-dir PATH]   (default: \$GIS_DIR)"; exit 0 ;;
+      *) die "install: unknown argument: $1" ;;
+    esac
+  done
+  [[ -n "${gis}" ]] || die "no GIS dir: pass --gis-dir PATH or export GIS_DIR"
+  [[ -d "${gis}/lidar" ]] || die "${gis}/lidar not found — is the data drive mounted?"
+
+  mkdir -p "${CONF_DIR}" "${QUADLET_DIR}" "${HOME}/.local/bin"
+  printf 'LIDAR_REPO=%s\nGIS_DIR=%s\n' "${REPO}" "${gis}" > "${CONF}"
+  echo "Wrote ${CONF}"
+  # Symlinks, so edits in the repo are live after a daemon-reload.
+  ln -sfn "${REPO}/quadlet/lidar@.container" "${QUADLET_DIR}/lidar@.container"
+  ln -sfn "${REPO}/lidar" "${HOME}/.local/bin/lidar"
+  echo "Linked ${QUADLET_DIR}/lidar@.container and ~/.local/bin/lidar"
+  systemctl --user daemon-reload
+  podman image exists "${IMAGE}" || cmd_build
+  echo "Installed. Try: lidar list"
+}
 
 sub="${1:-help}"; [[ $# -gt 0 ]] && shift
-
 case "${sub}" in
-  help|-h|--help)
-    exec "${HERE}/libexec/lidar-help" "$@" ;;
-  *)
-    bin="${HERE}/libexec/lidar-${sub}"
-    [[ -x "${bin}" ]] || { echo "lidar: unknown subcommand: ${sub}" >&2; exit 2; }
-    exec "${bin}" "$@" ;;
+  help|-h|--help) usage 0 ;;
+  run)            cmd_run "$@" ;;
+  list)           load_conf; in_container -t list "$@" ;;
+  size)           cmd_size "$@" ;;
+  kill)           cmd_kill "$@" ;;
+  restart)        cmd_restart "$@" ;;
+  build)          cmd_build ;;
+  test)           cmd_test ;;
+  install)        cmd_install "$@" ;;
+  *)              echo "lidar: unknown subcommand: ${sub}" >&2; exit 2 ;;
 esac

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tile download pipeline: dep-checking, prescan, make_dirs, download.
-# Requires lib/common.sh (LIDAR_DIR, DEM_DIR, GDAL_FLATPAK_APP, human_bytes,
+# Requires lib/common.sh (LIDAR_DIR, DEM_DIR, GDAL, human_bytes,
 # human_duration, project_from_url) and WORK_DIR set by the caller.
 
 [[ -n "${_LIDAR_DOWNLOAD_LOADED:-}" ]] && return 0
@@ -23,8 +23,8 @@ check_deps_and_input() {
   for dep in "${extra_deps[@]+"${extra_deps[@]}"}"; do
     command -v "${dep}" >/dev/null || { echo "ERROR: ${dep} not found"; exit 1; }
   done
-  flatpak list | grep -q "${GDAL_FLATPAK_APP}" \
-    || { echo "ERROR: flatpak app '${GDAL_FLATPAK_APP}' not installed"; exit 1; }
+  command -v "${GDAL[0]}" >/dev/null \
+    || { echo "ERROR: ${GDAL[0]} not found — run inside the lidar image"; exit 1; }
 
   if [[ ! -d "${LIDAR_DIR}" ]]; then
     echo "ERROR: Lidar dir not found: ${LIDAR_DIR}"

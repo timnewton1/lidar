@@ -4,27 +4,41 @@
 
 A bash CLI that turns USGS 3DEP lidar tile lists into Google Earth
 super-overlays (KML/KMZ) and/or Cloud-Optimized GeoTIFFs (COG). The user
-runs it on Bazzite (immutable Fedora), so all GDAL operations go through
-the Flatpak `org.qgis.qgis` app.
+runs it on Bazzite (immutable Fedora). The pipeline runs only inside the
+`localhost/lidar` Podman image (GDAL 3.13.3 from `ghcr.io/osgeo/gdal`);
+each run is a rootless quadlet unit `lidar@<hex>.service`. The QGIS Flatpak
+is no longer used (dropped 2026-10-25 — it blocked systemd hardening and
+escaped unit cgroups).
 
 See [`README.md`](README.md) for the user-facing overview.
 
 ## Layout
 
 ```
-lidar                  # dispatcher; sets LIDAR_HOME, execs libexec/lidar-<sub>
-libexec/lidar-<sub>    # one file per subcommand (run, list, log, size, kill, ...)
-lib/<name>.sh          # sourced libraries:
-  strict.sh              set -Eeuo pipefail + ERR trap; sourced first
-  common.sh              GDAL_* arrays, paths, KNOWN_SHADINGS, helpers
-  download.sh            tile download pipeline (check_deps, prescan, download)
-  gdal.sh                shading derivation, reprojection, VRT mosaic
-  kml.sh                 KMZ zip packaging
-  cog.sh                 COG output (DEM + shading), CRS detection, UTM auto-pick
-  events.sh              runs.jsonl events index used by `lidar list`
-systemd/lidar@.service # template for `lidar service install`
-tests/test_*.bats      # bats tests + fixtures/
-docs/superpowers/      # design specs and implementation plans
+lidar                    # HOST wrapper: stages inputs, podman run, systemctl.
+                         #   Only host-side logic lives here (install, build,
+                         #   test, kill, restart, unit start). Needs only podman.
+Containerfile            # image = GDAL + tools; NO code (repo is bind-mounted ro)
+.containerignore         # `*` — build context is intentionally empty
+quadlet/lidar@.container # one unit per run; symlinked into ~/.config/containers/systemd
+libexec/lidar-dispatch   # in-container ENTRYPOINT; execs libexec/lidar-<sub>
+libexec/lidar-<sub>      # in-container subcommands:
+  run                      plan only: validate, fan out, write job specs, print `@job <hex>`
+  worker                   Exec of lidar@<hex>: PID-1 supervisor + the pipeline
+  list, size               reporting
+  resolve                  hex prefix → full id (used by host kill/restart)
+lib/<name>.sh            # sourced libraries:
+  strict.sh                set -Eeuo pipefail + ERR trap; sourced first
+  common.sh                GDAL_* arrays, paths, KNOWN_SHADINGS, helpers
+  download.sh              tile download pipeline (check_deps, prescan, download)
+  gdal.sh                  shading derivation, reprojection, VRT mosaic
+  kml.sh                   KMZ zip packaging
+  cog.sh                   COG output (DEM + shading), CRS detection, UTM auto-pick
+  events.sh                runs.jsonl events index, liveness, run-id resolver
+  jobs.sh                  job spec write/load, --jobs slot semaphore
+  diag.sh                  pre-run environment banner, signal exit reasons
+tests/test_*.bats        # bats tests + fixtures/
+docs/superpowers/        # design specs and implementation plans
 ```
 
 ## Conventions to preserve
@@ -33,9 +47,21 @@ docs/superpowers/      # design specs and implementation plans
   `lib/strict.sh` first. Don't skip.
 - **Library files** start with `[[ -n "${_LIDAR_<NAME>_LOADED:-}" ]] && return 0`
   guards. Follow the pattern.
-- **GDAL is in Flatpak** — invoke via the `GDAL`, `GDALDEM`, `GDALINFO`,
-  `GDALWARP`, `GDALBUILDVRT`, `GDALTRANSLATE` arrays in `lib/common.sh`.
-  Never call `gdal_*` directly.
+- **GDAL comes from the image** — invoke via the `GDAL`, `GDALDEM`,
+  `GDALINFO`, `GDALWARP`, `GDALBUILDVRT`, `GDALTRANSLATE` arrays in
+  `lib/common.sh` (one indirection point; `run_gdal` logs them). Never call
+  `gdal_*` directly.
+- **Host vs container split.** Anything needing GDAL, jq, or the data layout
+  runs in the container. Anything needing systemd (unit start/stop, liveness)
+  runs in the host wrapper. The container learns which runs are alive only
+  via `LIDAR_ACTIVE` (space-separated ids) — PIDs mean nothing across
+  containers, so never reintroduce pid-based liveness.
+- **Dispatcher → worker hand-off is the job spec** (`lib/jobs.sh`). A new
+  flag the worker needs must be added to `JOB_VARS`, or the worker silently
+  uses defaults.
+- **Worker EXIT-trap state must be global.** The trap fires after
+  `_run_one_project` returns; locals are gone by then (regression test in
+  `test_cli.bats`).
 - **No backwards-compat aliases.** When the user asks to rename or replace
   a flag, the old form is removed cleanly (see the `--kmz`/`--cog` →
   `--output` refactor).
@@ -65,13 +91,16 @@ docs/superpowers/      # design specs and implementation plans
 ## Testing
 
 ```bash
-bats tests/
+lidar test        # bats inside the image (host has no GDAL)
 ```
 
-Tests run offline. Flag parsing, validation, dry-run output, and pure-bash
-helpers are testable. The end-to-end pipeline (downloads + Flatpak GDAL +
-real tiles) is not — verify those by running `lidar run` manually with a
-small fixture like `tests/fixtures/one_tile.txt`.
+Tests run offline. Flag parsing, validation, dry-run output, job specs, and
+pure-bash helpers are testable; tests call `libexec/lidar-dispatch`, not the
+host wrapper. The end-to-end pipeline (downloads + GDAL + real tiles) is not
+— verify by running `lidar run tests/fixtures/one_tile.txt` and checking
+`lidar list`. That fixture is a small live AZ_PimaCounty tile; USGS does
+retire tiles (the previous AK fixture 404s), so re-check it if it fails in
+STEP 4.
 
 When adding CLI surface, add bats coverage in `tests/test_cli.bats`. Match
 the existing patterns (the test that drives `-c is equivalent to --cog` was
@@ -79,12 +108,17 @@ the prior shape; `-o is equivalent to --output` is the current one).
 
 ## Environment
 
-- **OS**: Bazzite (immutable Fedora). Don't suggest `dnf install`; use
-  Flatpak or distrobox.
-- **Required env**: `GIS_DIR` must be set (or passed via `--gis-dir`). All
-  run outputs land under `${GIS_DIR}/lidar/`.
-- **`LIDAR_HOME`**: exported by the `lidar` entrypoint. Subcommands and
-  libs assume it's set.
+- **OS**: Bazzite (immutable Fedora). Don't suggest `dnf install`; new tools
+  go in the Containerfile.
+- **Config**: `~/.config/lidar/lidar.env` (`LIDAR_REPO`, `GIS_DIR`), written
+  by `lidar install`, read by the wrapper and by the quadlet (systemd expands
+  `${GIS_DIR}` / `${LIDAR_REPO}` in the generated ExecStart). There is no
+  per-command `--gis-dir`: the quadlet's mounts are fixed per install.
+- **Mounts**: repo → `/opt/lidar` (ro,z — it's under `$HOME`); `GIS_DIR` →
+  the same path in the container, so log/event paths are valid on the host.
+  The data disk is already `container_file_t`; don't add `:Z` to it.
+- **`LIDAR_HOME`**: `/opt/lidar` in the image (`ENV`). Subcommands and libs
+  assume it's set.
 
 ## Tile cache
 

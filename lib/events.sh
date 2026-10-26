@@ -22,8 +22,8 @@ events_emit_start() {
     first=0
   done
   urls_json+="]"
-  printf '{"id":"%s","event":"start","ts":"%s","pid":%d,"log":"%s","project":"%s","urls":%s}\n' \
-    "$(json_escape "${id}")" "${ts}" "$BASHPID" "$(json_escape "${log}")" \
+  printf '{"id":"%s","event":"start","ts":"%s","log":"%s","project":"%s","urls":%s}\n' \
+    "$(json_escape "${id}")" "${ts}" "$(json_escape "${log}")" \
     "$(json_escape "${project}")" "${urls_json}" \
     >> "${EVENTS_FILE}"
 }
@@ -46,6 +46,14 @@ cleanup_old_logs() {
   [[ -d "${log_dir}" ]] || return 0
   find "${log_dir}" -maxdepth 1 -type f -name '*.log' \
     -mtime "+${days}" -delete 2>/dev/null || true
+}
+
+# ─── Liveness ────────────────────────────────────────────────────────────────
+# A PID recorded inside one container means nothing in another, so liveness
+# comes from systemd: the host wrapper passes the ids of active lidar@ units
+# in LIDAR_ACTIVE (space-separated). Unset → nothing is considered running.
+run_is_active() {
+  [[ " ${LIDAR_ACTIVE:-} " == *" $1 "* ]]
 }
 
 # ─── Run ID resolver ─────────────────────────────────────────────────────────
@@ -104,7 +112,7 @@ resolve_input() {
     INPUT_TYPE="run"
     INPUT_RUN_ID="${id}"
     INPUT_TILE_LIST=$(jq -rs --arg id "${id}" '
-      .[] | select(.id == $id and .event == "start") | .urls[0] // ""
+      [ .[] | select(.id == $id and .event == "start") ] | last | .urls[0] // ""
     ' "${EVENTS_FILE}" 2>/dev/null || echo "")
     return 0
   fi
@@ -132,14 +140,13 @@ list_runs() {
   local rows
   rows=$(jq -s -r '
     group_by(.id) | map(
-      (map(select(.event=="start"))[0]) as $s
+      (map(select(.event=="start")) | last) as $s
       | .[-1] as $last
       | {
           id:       ($s.id // $last.id),
           project:  ($s.project // ""),
           started:  ($s.ts // ""),
           ended:    (if $last.event=="end" then $last.ts else "" end),
-          pid:      ($s.pid // 0),
           log:      ($s.log // ""),
           exit:     (if $last.event=="end" then $last.exit else null end),
           last_event: $last.event,
@@ -153,7 +160,7 @@ list_runs() {
           )
         }
     ) | sort_by(.started) | reverse
-    | .[] | [.id, .project, .started, .ended, (.pid|tostring), .log,
+    | .[] | [.id, .project, .started, .ended, .log,
              (.exit // "" | tostring), .last_event, (.duration_sec|tostring)] | join("")
   ' "${EVENTS_FILE}")
 
@@ -168,13 +175,13 @@ list_runs() {
   fi
 
   printf "%-8s  %-6s  %-19s  %9s  %s\n" "STATUS" "HEX" "STARTED" "DURATION" "PROJECT"
-  while IFS=$'\x1f' read -r id project started ended pid log exit_code last_event duration_sec; do
+  while IFS=$'\x1f' read -r id project started ended log exit_code last_event duration_sec; do
     [[ -z "${id}" ]] && continue
     local status
     if [[ "${last_event}" == "end" ]]; then
       [[ "${exit_code}" == "0" ]] && status="success" || status="failed"
     else
-      if [[ "${pid}" -gt 0 ]] && kill -0 "${pid}" 2>/dev/null; then
+      if run_is_active "${id}"; then
         status="running"
       else
         status="crashed"

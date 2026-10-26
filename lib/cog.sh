@@ -21,8 +21,8 @@ _LIDAR_COG_LOADED=1
 # Args: <raster>
 #
 # A single gdalinfo -json call extracts both the WKT (to detect geographic CRS)
-# and cornerCoordinates.center (for UTM auto-pick). This avoids two Flatpak
-# spawns when the source is geographic — Flatpak bwrap overhead is 100-400 ms.
+# and cornerCoordinates.center (for UTM auto-pick) — one raster open instead
+# of two when the source is geographic.
 #
 # Why not a substring check on the WKT: PROJCRS WKT contains BASEGEOGCRS as a
 # child, so naive "GEOGCRS in wkt" produces false positives on projected rasters.

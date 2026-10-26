@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# In-container entrypoint (see Containerfile). Execs libexec/lidar-<sub>.
+# The host-side `lidar` wrapper at the repo root is what users run.
+set -Eeuo pipefail
+export LIDAR_HOME="${LIDAR_HOME:-$(cd "$(dirname "$(realpath "$0")")/.." && pwd)}"
+export PATH="${LIDAR_HOME}/libexec:${PATH}"
+
+sub="${1:-help}"; [[ $# -gt 0 ]] && shift
+
+case "${sub}" in
+  help|-h|--help)
+    echo "Usage: lidar <subcommand> [options...]  (in-container entrypoint;"
+    echo "run the host \`lidar\` wrapper — \`lidar help\` there lists subcommands)" ;;
+  dispatch)
+    echo "lidar: unknown subcommand: ${sub}" >&2; exit 2 ;;
+  *)
+    bin="${LIDAR_HOME}/libexec/lidar-${sub}"
+    [[ -x "${bin}" ]] || { echo "lidar: unknown subcommand: ${sub}" >&2; exit 2; }
+    exec "${bin}" "$@" ;;
+esac

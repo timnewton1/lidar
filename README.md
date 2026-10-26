@@ -9,19 +9,38 @@ download the resulting `.txt` link list, point `lidar run` at it.
 
 ## Requirements
 
-- Bash 4+, `curl`, `numfmt` (coreutils), `python3`
-- Flatpak with the `org.qgis.qgis` app installed (provides GDAL)
-- `zip` (only if you ask for `kmz` output)
-- [`bats-core`](https://github.com/bats-core/bats-core) (only for running tests)
+- Podman 5+ and a systemd user session (rootless quadlets)
+- That's it on the host. GDAL 3.13.3, curl, jq, zip, python3 and bats all
+  live in the container image (see [`Containerfile`](Containerfile)).
 
 ## Install
 
 ```bash
 git clone https://github.com/timnewton1/lidar.git
 cd lidar
-ln -s "$PWD/lidar" ~/.local/bin/lidar      # or put it on your PATH another way
-export GIS_DIR=/path/to/your/gis           # where runs live
+./lidar install --gis-dir /path/to/your/gis   # or export GIS_DIR first
 ```
+
+`install` writes `~/.config/lidar/lidar.env` (repo path + GIS dir), symlinks
+`quadlet/lidar@.container` into `~/.config/containers/systemd/` and `lidar`
+into `~/.local/bin/`, reloads systemd, and builds `localhost/lidar:latest`
+if it doesn't exist. Re-run it if you move the repo or the GIS dir.
+
+## How it runs
+
+```
+lidar run list.txt
+  │ copies list.txt onto the data disk (inputs/)
+  ├─ podman run --rm lidar run …      plan: validate, fan out by project,
+  │                                   write jobs/<hex>.env + <hex>.urls
+  └─ systemctl --user start lidar@<hex>.service   (one per project)
+        └─ container lidar-<hex>: worker <hex> → the pipeline
+```
+
+The repo is bind-mounted read-only into every container, so code edits take
+effect on the next run. Rebuild (`lidar build`) only when the Containerfile
+changes. Each run is an ordinary systemd unit:
+`systemctl --user status lidar@<hex>`, `journalctl --user -u lidar@<hex>`.
 
 ## Quick start
 
@@ -53,6 +72,8 @@ ${GIS_DIR}/lidar/
   projects/<project>/<hex>/cog/     # Cloud-Optimized GeoTIFFs + README.md
   logs/<hex>.log                    # per-run log file
   logs/runs.jsonl                   # events index
+  jobs/<hex>.env, <hex>.urls        # job spec each lidar@<hex> unit runs (kept for restart)
+  inputs/<stamp>/                   # copies of the local tile lists you passed to `run`
 ```
 
 ## Subcommands
@@ -60,10 +81,13 @@ ${GIS_DIR}/lidar/
 | Command | What it does |
 |---|---|
 | `lidar run` | Download tiles, mosaic, derive shading, build outputs |
-| `lidar list [<hex>]` | Run table, or stream/page one run's log |
-| `lidar size <hex>` | Disk usage breakdown for a run's output |
-| `lidar kill <hex\|PID>` | Stop a running pipeline (or `--all`) |
-| `lidar restart <hex>` | Re-run a completed or failed run |
+| `lidar list [<hex>]` | Run table, or follow/page one run's log |
+| `lidar size <list\|hex>` | Estimate download size for a tile list or run |
+| `lidar kill <hex>…` / `--all` | Stop running pipeline(s) (`systemctl stop`) |
+| `lidar restart <hex>…` | Re-run in place: same hex, same flags; replaces that run's output |
+| `lidar install` | One-time setup (config, quadlet, PATH link, image) |
+| `lidar build` | Rebuild the container image |
+| `lidar test` | Run the bats suite inside the image |
 | `lidar help` | This help |
 
 Run `lidar <subcommand> --help` for per-subcommand flags.
@@ -83,21 +107,25 @@ a UTM zone from the data centroid if geographic. Override with
 ## Layout
 
 ```
-lidar                  # entrypoint dispatcher
-libexec/lidar-*        # subcommand implementations
-lib/*.sh               # shared helpers (gdal, kml, cog, download, events)
-tests/                 # bats tests + fixtures
-docs/superpowers/      # design specs and implementation plans
+lidar                    # host wrapper (podman + systemctl); what you run
+Containerfile            # runtime image: GDAL + tools, no code
+quadlet/lidar@.container # one unit per run
+libexec/lidar-dispatch   # in-container entrypoint → libexec/lidar-<sub>
+libexec/lidar-*          # run (plan), worker (pipeline), list, size, resolve
+lib/*.sh                 # shared helpers (gdal, kml, cog, download, events, jobs)
+tests/                   # bats tests + fixtures
+docs/superpowers/        # design specs and implementation plans
 ```
 
 ## Testing
 
 ```bash
-bats tests/
+lidar test
 ```
 
-Most tests run offline (flag parsing, dry-run). The full pipeline needs
-Flatpak GDAL + real tile downloads; those are not in the test suite.
+Tests run offline inside the image (flag parsing, dry-run, job specs,
+helpers). The full pipeline needs real tile downloads; verify it with
+`lidar run tests/fixtures/one_tile.txt`.
 
 ## License
 

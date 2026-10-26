@@ -89,7 +89,7 @@ _read_raster_dims() {
 # compute_zoom_and_lookat: single gdalinfo call that emits both the max zoom
 # level and the LookAt "lon lat range" on two lines.
 # Combines what compute_max_zoom + compute_lookat used to do in two separate
-# Flatpak spawns — saves one bwrap invocation per (shading × project) pair.
+# gdalinfo calls — one raster open per (shading × project) pair instead of two.
 #
 # Output (two lines on stdout):
 #   <max_zoom>

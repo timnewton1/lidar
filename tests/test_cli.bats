@@ -5,7 +5,8 @@ setup() {
   mkdir -p "${GIS_DIR}/lidar/logs"
   export LIDAR_HOME
   LIDAR_HOME=$(cd "${BATS_TEST_DIRNAME}/.." && pwd)
-  LIDAR="${LIDAR_HOME}/lidar"
+  # The in-container entrypoint; the host wrapper only adds podman/systemd.
+  LIDAR="${LIDAR_HOME}/libexec/lidar-dispatch"
   FIXTURES="${LIDAR_HOME}/tests/fixtures"
 }
 
@@ -70,7 +71,7 @@ setup() {
 }
 
 @test "lidar run --output cog --cog-crs EPSG:32614 accepted (validation passes)" {
-  # Validation happens before deps; the run will fail later on flatpak/inputs,
+  # Validation happens before job specs are written; downstream may fail,
   # but the EPSG check itself must pass — i.e. no "--cog-crs must match" error.
   run bash -c "\"${LIDAR}\" run --output cog --cog-crs EPSG:32614 \"${FIXTURES}/one_tile.txt\" 2>&1 || true"
   [[ "${output}" != *"--cog-crs must match"* ]]
@@ -99,7 +100,6 @@ setup() {
 }
 
 @test "lidar run --dry-run prints plan header" {
-  # Accept non-zero if flatpak/GDAL absent; validation runs before deps check.
   run bash -c "
     export GIS_DIR=\"${GIS_DIR}\"
     export LIDAR_HOME=\"${LIDAR_HOME}\"
@@ -110,23 +110,45 @@ setup() {
   [[ "${output}" != *"Unknown flag: --name"* ]]
 }
 
-@test "lidar run --dry-run passes with one_tile.txt (integration-safe)" {
-  skip "requires flatpak GDAL installed — integration test only"
+@test "lidar run --dry-run passes with one_tile.txt and writes no job" {
+  rm -rf "${GIS_DIR}/lidar/jobs"
   run "${LIDAR}" run --dry-run "${FIXTURES}/one_tile.txt"
   [ "${status}" -eq 0 ]
   [[ "${output}" == *"DRY RUN PLAN"* ]]
+  [[ "${output}" != *"@job "* ]]
+  [ ! -d "${GIS_DIR}/lidar/jobs" ]
 }
 
-@test "lidar kill with no args exits 2" {
+@test "lidar run writes a job spec and emits @job for each project" {
+  rm -rf "${GIS_DIR}/lidar/jobs"
+  run "${LIDAR}" run -s hillshade,slopeshade -o cog "${FIXTURES}/one_tile.txt"
+  [ "${status}" -eq 0 ]
+  local hex; hex=$(grep '^@job ' <<< "${output}" | head -1 | cut -d' ' -f2)
+  [[ "${hex}" =~ ^[0-9a-f]{6}$ ]]
+  [ -s "${GIS_DIR}/lidar/jobs/${hex}.urls" ]
+  # The spec must round-trip the resolved flags for the worker.
+  run bash -c "source '${GIS_DIR}/lidar/jobs/${hex}.env'; echo \"\${SHADINGS[*]}|\${OUTPUT_COG}|\${OUTPUT_KML}|\${JOB_PROJECT}\""
+  [[ "${output}" == "hillshade slopeshade|1|0|"?* ]]
+  # The dispatcher's own scratch is gone once specs are written.
+  [ -z "$(compgen -G "${GIS_DIR}/lidar/.work_*")" ]
+}
+
+@test "lidar resolve prints the full id for a prefix" {
+  mkdir -p "${GIS_DIR}/lidar/logs"
+  printf '{"id":"abc123","event":"start","ts":"2026-01-01T00:00:00Z","log":"","project":"p","urls":[]}\n' \
+    > "${GIS_DIR}/lidar/logs/runs.jsonl"
+  run "${LIDAR}" resolve abc
+  [ "${status}" -eq 0 ]
+  [ "${output}" = "abc123" ]
+  run "${LIDAR}" resolve zzz
+  [ "${status}" -ne 0 ]
+}
+
+@test "lidar kill and restart are host-only (not in the container)" {
   run "${LIDAR}" kill
   [ "${status}" -eq 2 ]
-}
-
-@test "lidar kill 1 refuses untracked PID" {
-  rm -f "${GIS_DIR}/lidar/logs/runs.jsonl"
-  run "${LIDAR}" kill 1
-  [ "${status}" -ne 0 ]
-  [[ "${output}" == *"REFUSE PID 1"* ]]
+  run "${LIDAR}" restart
+  [ "${status}" -eq 2 ]
 }
 
 @test "events_emit_start writes project field and urls key" {
@@ -142,33 +164,18 @@ setup() {
 
 @test "Bug A: _on_project_exit captures \$? before re-entrancy guard" {
   # Verify the fix is in place: local _rc=\$? must appear before the [[ check.
-  local src="${LIDAR_HOME}/libexec/lidar-run"
+  local src="${LIDAR_HOME}/libexec/lidar-worker"
   local rc_line guard_line
   rc_line=$(grep -n 'local _rc=\$?' "${src}" | head -1 | cut -d: -f1)
   guard_line=$(grep -n '\[\[ \${_on_exit_done}' "${src}" | head -1 | cut -d: -f1)
   (( rc_line < guard_line ))
 }
 
-@test "Bug B: events_emit_start uses BASHPID not \$\$" {
-  grep -q '\$BASHPID' "${LIDAR_HOME}/lib/events.sh"
-  ! grep -qP '"pid":%d.*\$\$' "${LIDAR_HOME}/lib/events.sh"
-}
-
-@test "Bug B: events_emit_start not called in pre-fork loop in lidar-run" {
-  local src="${LIDAR_HOME}/libexec/lidar-run"
-  # All events_emit_start calls must be inside _run_one_project, not in the
-  # pre-fork dispatch loop. Guard: no calls should appear after the line
-  # that defines _HEXES=() (start of pre-fork loop) and before the supervisor
-  # subshell comment.
-  local hexes_line supervisor_line
-  hexes_line=$(grep -n 'declare -a _HEXES' "${src}" | head -1 | cut -d: -f1)
-  supervisor_line=$(grep -n '^# Supervisor subshell' "${src}" | head -1 | cut -d: -f1)
-  # If any events_emit_start call falls in [hexes_line, supervisor_line], fail
-  local found=0
-  while IFS= read -r ln; do
-    (( ln >= hexes_line && ln <= supervisor_line )) && found=1
-  done < <(grep -n 'events_emit_start' "${src}" | cut -d: -f1)
-  (( found == 0 ))
+@test "events: start is emitted only by the worker, never the dispatcher" {
+  # The dispatcher only writes job specs; a start event there would show a
+  # run as alive before its unit exists.
+  ! grep -q 'events_emit_start' "${LIDAR_HOME}/libexec/lidar-run"
+  grep -q 'events_emit_start' "${LIDAR_HOME}/libexec/lidar-worker"
 }
 
 # ─── Fan-out flags ────────────────────────────────────────────────────────────
@@ -203,7 +210,7 @@ setup() {
   [[ "${output}" != *"Too many"* ]]
 }
 
-# ─── list / restart subcommands ──────────────────────────────────────────────
+# ─── list subcommand ─────────────────────────────────────────────────────────
 
 @test "lidar list with no args exits 0" {
   run "${LIDAR}" list
@@ -217,22 +224,24 @@ setup() {
   [[ "${output}" == *"lidar list"* ]]
 }
 
-@test "lidar restart with no args exits 2" {
-  run "${LIDAR}" restart
-  [ "${status}" -eq 2 ]
+@test "lidar list marks a run with no end event as crashed unless active" {
+  printf '{"id":"abc123","event":"start","ts":"2026-01-01T00:00:00Z","log":"","project":"p","urls":[]}\n' \
+    > "${GIS_DIR}/lidar/logs/runs.jsonl"
+  run env LIDAR_ACTIVE="" "${LIDAR}" list
+  [[ "${output}" == *"crash"*"abc123"* ]]
+  run env LIDAR_ACTIVE="ffffff abc123" "${LIDAR}" list
+  [[ "${output}" == *"run"*"abc123"* ]]
 }
 
-@test "lidar restart --help exits 0" {
-  run "${LIDAR}" restart --help
-  [ "${status}" -eq 0 ]
-  [[ "${output}" == *"lidar restart"* ]]
-}
-
-@test "lidar restart unknown hex exits non-zero with error message" {
-  rm -f "${GIS_DIR}/lidar/logs/runs.jsonl"
-  run "${LIDAR}" restart aabbcc
-  [ "${status}" -ne 0 ]
-  [[ "${output}" == *"no run"* || "${output}" == *"no runs"* ]]
+@test "lidar list uses the latest start after a restart" {
+  {
+    printf '{"id":"abc123","event":"start","ts":"2026-01-01T00:00:00Z","log":"","project":"p","urls":[]}\n'
+    printf '{"id":"abc123","event":"end","ts":"2026-01-01T00:01:00Z","exit":1}\n'
+    printf '{"id":"abc123","event":"start","ts":"2026-02-02T00:00:00Z","log":"","project":"p","urls":[]}\n'
+  } > "${GIS_DIR}/lidar/logs/runs.jsonl"
+  run env LIDAR_ACTIVE="abc123" "${LIDAR}" list
+  [[ "${output}" == *"2026-02-02"* ]]
+  [[ "${output}" != *"2026-01-01"* ]]
 }
 
 # ─── Removed subcommands ─────────────────────────────────────────────────────
@@ -276,7 +285,7 @@ setup() {
   # Every mktemp invocation must reference one of the output-disk path
   # variables (LIDAR_DIR, WORK_DIR, _proj_work) — either via -p/-d or in
   # the template positional. A bare mktemp lands in /tmp = tmpfs.
-  run grep -nE 'mktemp(\s|$)' "${LIDAR_HOME}/libexec/lidar-run" "${LIDAR_HOME}/lib"/*.sh
+  run grep -nE 'mktemp(\s|$)' "${LIDAR_HOME}/libexec/lidar-run" "${LIDAR_HOME}/libexec/lidar-worker" "${LIDAR_HOME}/lib"/*.sh
   while IFS= read -r line; do
     [[ -z "${line}" ]] && continue
     if [[ "${line}" == *'LIDAR_DIR'* \
@@ -289,3 +298,14 @@ setup() {
   done <<< "${output}"
 }
 
+
+@test "worker EXIT trap only reads globals (it fires after the function returns)" {
+  # Regression: the trap used function locals and died with "unbound
+  # variable" after a successful run, so no end event was written.
+  local src="${LIDAR_HOME}/libexec/lidar-worker"
+  ! grep -qE 'local _on_exit_done|local _proj_work' "${src}"
+  local body
+  body=$(sed -n '/_on_project_exit() {/,/^  }/p' "${src}")
+  [[ "${body}" == *'"${HEX}"'* ]]
+  [[ "${body}" != *'_hex'* ]]
+}

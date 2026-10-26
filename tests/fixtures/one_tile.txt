@@ -1,1 +1,1 @@
-https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1m/Projects/AK_FairbanksNorthStar_2017_D17/TIFF/USGS_one_meter_x12y713_AK_FairbanksNorthStar_2017_D17.tif
+https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/OPR/Projects/AZ_PimaCounty_2021_B21/AZ_PimaCo_2_2021/TIFF/USGS_OPR_AZ_PimaCounty_2021_B21_411495.tif
